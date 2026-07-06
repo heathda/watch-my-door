@@ -1,0 +1,145 @@
+# Copy this to cameras.yaml and edit for your cameras:
+#     cp cameras.yaml.example cameras.yaml   (or copy on Windows)
+# cameras.yaml is gitignored so your real camera names/layout stay private.
+#
+# Each top-level key MUST match the BlueIris camera name (the &CAM macro)
+# exactly, including case and hyphens.
+#
+#   prompt              the question + the allowed LABELS for this camera.
+#                       ALWAYS include a "nothing" label (e.g. NONE) -- the
+#                       vision model is the only filter, so most frames are
+#                       routine and it must be able to say so.
+#   alert_on            labels that should notify. The model's first-line LABEL
+#                       is matched (substring, case-insensitive) against this.
+#                       Leave the "nothing" label OUT of this list. Every label
+#                       here must also appear in the prompt (tests enforce this).
+#   notify_cooldown_sec don't re-email for this camera within this many seconds
+#                       of the last alert (stops repeat motion from spamming).
+#
+# The model replies with the LABEL on line 1 and a short description after it;
+# the description is what goes in the notification email.
+#
+# TIP -- log-only labels: any label you put in the prompt but LEAVE OUT of
+# alert_on is still classified and written to events.db, it just won't email
+# you. This is the recommended way to try a new label: add it, watch it with
+#     python review.py --counts
+# for a while, then promote the accurate ones into alert_on once you trust them.
+#
+# GOTCHA -- alert_on matches by SUBSTRING. A label that CONTAINS an alerting
+# token will itself alert. e.g. if "DOOR_OPEN" is in alert_on, a label named
+# "DOOR_OPEN_AT_NIGHT" also fires. Name log-only variants so they don't overlap
+# (this example uses "GARAGE_OPEN_NIGHT", not "DOOR_OPEN_AT_NIGHT").
+
+# --- Example: a front-of-house / entry camera ----------------------------
+# Describe the scene concretely (near/far, entry points, which way is "toward
+# the house") -- the model classifies far better with a spatial mental map.
+front-cam:
+  prompt: >
+    This is a front-yard / entry camera. The house is on the near side, behind
+    the front landscaping. A walkway runs from the driveway to the porch, where
+    the front door is (a house entry point). The street is on the far side --
+    a person moving toward the street is moving away from the house.
+    Choose the single best label for the main activity:
+    LOITERING (a person lingering with no clear purpose),
+    APPROACHING (a person moving toward the house, porch, or front door),
+    PASSING_BY (a person or vehicle simply passing along the sidewalk or street;
+    someone in the driveway is NOT just passing by),
+    DELIVERY (a package delivery in progress -- a UPS, FedEx, or Amazon van or
+    truck, or a uniformed courier carrying or dropping off a package),
+    MAIL_TRUCK (a USPS mail carrier or mail truck delivering ordinary mail),
+    LOOKING_IN (a person peering into a window or staring directly at the camera),
+    MULTIPLE_PEOPLE (a group of two or more people together),
+    AT_NIGHT_PERSON (a person present when it is clearly dark/nighttime),
+    NONE (nothing relevant visible).
+    Then briefly describe what you see.
+  # MAIL_TRUCK / LOOKING_IN / MULTIPLE_PEOPLE / AT_NIGHT_PERSON are logged only
+  # (left out of alert_on) until you've confirmed the model uses them well.
+  alert_on: ["LOITERING", "APPROACHING", "DELIVERY"]
+  notify_cooldown_sec: 300
+
+# --- Example: a driveway camera ------------------------------------------
+# Note how KNOWN_VEHICLE names the specific cars that belong here, so the model
+# can tell them apart from an UNFAMILIAR_VEHICLE. Swap in your own vehicles.
+driveway-cam:
+  prompt: >
+    This is a driveway camera looking down the driveway toward the street. The
+    gate across the driveway is usually closed.
+    Choose the single best label:
+    UNFAMILIAR_VEHICLE (a vehicle that looks out of place or unexpected),
+    PERSON (a person on or near the driveway),
+    KNOWN_VEHICLE (an ordinary, expected, or already-parked vehicle, e.g. a
+    silver sedan or a red pickup truck that belong here),
+    DELIVERY (a package delivery in progress -- a UPS, FedEx, or Amazon van or
+    truck, or a uniformed courier carrying or dropping off a package),
+    MAIL_TRUCK (a USPS mail carrier or mail truck delivering ordinary mail),
+    GATE_OPEN (the driveway gate is open or partly open),
+    VEHICLE_ARRIVING (a vehicle moving toward the house/driveway),
+    VEHICLE_LEAVING (a vehicle moving away, toward the street),
+    LOOKING_IN (a person peering into a window/vehicle or staring at the camera),
+    MULTIPLE_PEOPLE (a group of two or more people together),
+    AT_NIGHT_PERSON (a person present when it is clearly dark/nighttime),
+    NONE (nothing relevant visible).
+    Then briefly describe what you see.
+  # Direction (ARRIVING/LEAVING) and counting (MULTIPLE_PEOPLE) are harder for a
+  # single-frame model -- keep them log-only until you've reviewed the results.
+  alert_on: ["UNFAMILIAR_VEHICLE", "PERSON", "DELIVERY"]
+  notify_cooldown_sec: 1800
+
+# --- Example: an inside-the-garage camera --------------------------------
+garage-cam:
+  prompt: >
+    This camera is inside a garage. The overhead garage door should normally be
+    closed. A silver sedan and a red pickup truck are usually parked inside. The
+    overhead door slides up to open and down to close.
+    Choose the single best label:
+    PERSON (a person is inside the garage),
+    DOOR_OPEN (the overhead garage door is open or partly open),
+    GARAGE_OPEN_NIGHT (the overhead door is open or partly open AND it is clearly
+    dark/nighttime outside),
+    VEHICLE_MISSING (the door is closed and neither the sedan nor the truck is
+    present -- an expected vehicle is gone),
+    CLOSED (the overhead door is closed and no one is present),
+    NONE (nothing relevant visible).
+    Then briefly describe what you see.
+  # GARAGE_OPEN_NIGHT is deliberately named to NOT contain "DOOR_OPEN" so it can
+  # be logged without alerting. VEHICLE_MISSING is experimental (counting).
+  alert_on: ["PERSON", "DOOR_OPEN"]
+  notify_cooldown_sec: 1800
+
+# --- Example: a back patio / sliding-door camera (with a known pet) -------
+# You can give the model a label for a specific known subject (e.g. a pet) and
+# leave it out of alert_on so it's logged but never emails. REX below is a made-
+# up dog -- describe your own pet's size/color so the model can distinguish it
+# from a stray ANIMAL.
+patio-cam:
+  prompt: >
+    This camera covers a back patio and a sliding glass door (a house entry
+    point) plus part of the back yard.
+    Choose the single best label:
+    PERSON_AT_DOOR (a person on the patio or approaching the sliding door),
+    LOITERING (a person lingering in the yard with no clear purpose),
+    REX (our dog: a large brown dog that lives here -- use this label for that
+    specific dog),
+    ANIMAL (any other animal, such as a stray dog, deer, cat, or raccoon),
+    LOOKING_IN (a person peering into the sliding door/window or staring at the camera),
+    MULTIPLE_PEOPLE (a group of two or more people together),
+    AT_NIGHT_PERSON (a person present when it is clearly dark/nighttime),
+    NONE (nothing relevant visible).
+    Then briefly describe what you see.
+  # REX is intentionally omitted from alert_on: logged, never emails.
+  alert_on: ["PERSON_AT_DOOR", "LOITERING", "ANIMAL"]
+  notify_cooldown_sec: 300
+
+# --- Example: an indoor utility/laundry camera, leak & smoke watch --------
+utility-cam:
+  prompt: >
+    This camera is in a utility/laundry room with a washer and dryer.
+    Choose the single best label:
+    WATER_ON_FLOOR (visible water, a puddle, or flooding on the floor),
+    APPLIANCE_LEAK (water specifically pooling under or around the washer/dryer),
+    SMOKE_OR_HAZE (visible smoke or haze in the air),
+    PERSON (a person is in the room),
+    NONE (nothing relevant visible).
+    Then briefly describe what you see.
+  alert_on: ["WATER_ON_FLOOR", "APPLIANCE_LEAK", "SMOKE_OR_HAZE"]
+  notify_cooldown_sec: 1800

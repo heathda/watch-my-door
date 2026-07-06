@@ -1,0 +1,51 @@
+# --- Secrets & local state ---
+.env
+cameras.yaml          # your real cameras (names/layout); ship cameras.yaml.example
+events.db
+events.db-journal
+events.db-wal
+events.db-shm
+*.log
+cam_watcher.bat
+cameras.yaml
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+
+# --- Test images / screenshots ---
+# Headless project: no image assets are committed. Alert frames and manual
+# screenshots get dropped in here during testing -- keep them out of the repo.
+# (If you ever commit a doc image, add an exception, e.g. `!docs/diagram.png`.)
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# --- OS cruft ---
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- Local notes (not shared) ---
+docs/
+CLAUDE.md
+TO-DO.md
+*.eml
+
+# --- Demo folder ---
+demo/*.eml
+# Images are ignored globally above; allow ONE curated, censored demo screenshot.
+# Name your redacted email screenshot exactly this to commit it:
+!demo/example-alert.png

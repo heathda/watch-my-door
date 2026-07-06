@@ -1,0 +1,13 @@
+@echo off
+REM BlueIris wrapper. In Camera Properties -> Alerts -> On Alert -> "Run an
+REM executable", point File: at this .bat and set Parameters to:  "&CAM" "&ALERT_PATH"
+REM
+REM The .bat exists because BlueIris passing args straight to python.exe via
+REM Windows file association is unreliable. %~dp0 is this file's folder, so the
+REM script works no matter what working directory BlueIris launches it from.
+REM
+REM PYTHON is pinned to a full path because BlueIris may run under a service
+REM account where "python" is not on PATH. Change it if your Python moves.
+
+set "PYTHON=C:\Program Files\Python312\python.exe"
+"%PYTHON%" "%~dp0cam_watcher.py" %*
