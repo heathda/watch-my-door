@@ -17,6 +17,10 @@ Rules:
   and nothing else on that line.
 - If nothing relevant or noteworthy is visible, use the camera's "nothing" label
   (e.g. NONE). Do not promote ordinary or ambiguous scenes into alerts.
+- If the question names a default label for uncertain or hard-to-see cases
+  (e.g. a closed/normal-state label when something is dark, obscured, or hard
+  to make out), use that default whenever you cannot clearly see the condition.
+  Never pick the alarming option because you cannot see clearly.
 - Describe only what is actually visible. Do not speculate beyond the image,
   guess at intent you cannot see, or hedge.
 - Keep the description short and factual.

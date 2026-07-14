@@ -1,13 +1,16 @@
 # --- Secrets & local state ---
 .env
-cameras.yaml          # your real cameras (names/layout); ship cameras.yaml.example
+# your real cameras (names/layout); ship cameras.yaml.example
+# (no trailing comments in this file -- git treats them as part of the pattern)
+cameras.yaml
+# local copy of the live prod config (same sensitivity)
+cameras-prod.yaml
 events.db
 events.db-journal
 events.db-wal
 events.db-shm
 *.log
 cam_watcher.bat
-cameras.yaml
 
 # --- Python ---
 __pycache__/

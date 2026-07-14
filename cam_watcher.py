@@ -30,6 +30,7 @@ import yaml
 from dotenv import load_dotenv
 
 import db
+import risk
 from notify import send_email
 
 SCRIPT_DIR = Path(__file__).parent
@@ -189,13 +190,30 @@ def main() -> None:
     label, description = parse_answer(raw)
     logger.info(f"[{cam}] {label} -- {description} ({latency_ms} ms)")
 
+    # Risk scoring (shadow mode): compute and log the rolling score, but take
+    # no action on it yet. The score is a pure function of the recent event
+    # log, so it needs no stored state -- see risk.py.
+    risk_kw = {}
+    risk_cfg = risk.risk_config(config)
+    if risk_cfg:
+        now = time.time()
+        window = float(risk_cfg.get("window_sec", risk.DEFAULT_WINDOW_SEC))
+        past = db.recent_events(conn, now - window)
+        delta = risk.event_delta(cam, label, now, config)
+        # Score the current event WITH the history (not added separately) so
+        # repeat dampening ranks it as the newest of its (camera, label).
+        score = risk.score_events(past + [(cam, label, now)], now, config)
+        tier = risk.tier_for(score, config)
+        risk_kw = {"risk_delta": delta, "risk_score": score, "risk_tier": tier}
+        logger.info(f"[{cam}] risk score {score:.1f} ({tier}), event +{delta:.1f}")
+
     alert_tags = cfg.get("alert_on", [])
     is_match = any(tag.upper() in label for tag in alert_tags)
 
     if not is_match:
         db.log_event(
             conn, cam, label, description, raw, latency_ms, image_path,
-            alerted=False, note="no-match",
+            alerted=False, note="no-match", **risk_kw,
         )
         return
 
@@ -206,7 +224,7 @@ def main() -> None:
         logger.info(f"[{cam}] '{label}' suppressed (cooldown {cooldown}s)")
         db.log_event(
             conn, cam, label, description, raw, latency_ms, image_path,
-            alerted=False, note="cooldown",
+            alerted=False, note="cooldown", **risk_kw,
         )
         return
 
@@ -218,7 +236,7 @@ def main() -> None:
     )
     db.log_event(
         conn, cam, label, description, raw, latency_ms, image_path,
-        alerted=sent, note=None if sent else "email failed",
+        alerted=sent, note=None if sent else "email failed", **risk_kw,
     )
 
 
