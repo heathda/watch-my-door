@@ -29,6 +29,35 @@
 # token will itself alert. e.g. if "DOOR_OPEN" is in alert_on, a label named
 # "DOOR_OPEN_AT_NIGHT" also fires. Name log-only variants so they don't overlap
 # (this example uses "GARAGE_OPEN_NIGHT", not "DOOR_OPEN_AT_NIGHT").
+#
+# RISK SCORING (optional, shadow mode) -- the `_risk` block below plus each
+# camera's `risk` block drive a rolling risk score: every event adds
+#     label weight x camera multiplier x night multiplier
+# points, and the total decays exponentially when things are quiet. Blips
+# fade; patterns escalate. Scores/tiers are logged to events.db (they don't
+# change alerting yet). Labels missing from label_weights score 0. Tune
+# weights against your own history with:  python replay.py
+# Delete the `_risk` block to turn the feature off entirely.
+
+# --- Risk scoring (global) ------------------------------------------------
+# TIP: give night-flavored labels (AT_NIGHT_PERSON, GARAGE_OPEN_NIGHT, ...)
+# LOW base weights and let the night multiplier escalate them -- then a
+# daytime mislabel stays quiet while a real 2am hit lands high immediately.
+_risk:
+  half_life_sec: 600            # a lone blip loses half its weight in 10 min
+  window_sec: 7200              # events older than 2 h can't move the score
+  repeat_dampening: 0.5         # each older repeat of the same camera+label
+                                # counts half again -- frames of one ongoing
+                                # condition don't stack like distinct signals
+  night:
+    start: "22:00"
+    end: "06:00"
+    multiplier: 3.0
+  tiers:                        # lower bound -> tier name
+    QUIET: 0                    # log only
+    NOTICE: 20                  # email
+    ELEVATED: 50                # email, flagged subject (planned)
+    URGENT: 80                  # urgent channel (planned)
 
 # --- Example: a front-of-house / entry camera ----------------------------
 # Describe the scene concretely (near/far, entry points, which way is "toward
@@ -40,7 +69,10 @@ front-cam:
     the front door is (a house entry point). The street is on the far side --
     a person moving toward the street is moving away from the house.
     Choose the single best label for the main activity:
-    LOITERING (a person lingering with no clear purpose),
+    LOITERING (a person lingering with no clear purpose -- NOT someone doing
+    yard work; that is YARD_WORK),
+    YARD_WORK (a person doing routine yard or house maintenance -- watering,
+    mowing, gardening, trimming, or taking out bins),
     APPROACHING (a person moving toward the house, porch, or front door),
     PASSING_BY (a person or vehicle simply passing along the sidewalk or street;
     someone in the driveway is NOT just passing by),
@@ -56,6 +88,18 @@ front-cam:
   # (left out of alert_on) until you've confirmed the model uses them well.
   alert_on: ["LOITERING", "APPROACHING", "DELIVERY"]
   notify_cooldown_sec: 300
+  risk:
+    multiplier: 1.0             # street-facing: noisy, least alarming view
+    label_weights:
+      LOOKING_IN: 40
+      LOITERING: 30
+      APPROACHING: 20
+      MULTIPLE_PEOPLE: 12
+      AT_NIGHT_PERSON: 12       # low base weight; the night multiplier escalates it
+      DELIVERY: 5
+      MAIL_TRUCK: 2
+      PASSING_BY: 2             # routine, but twenty in ten minutes should register
+      YARD_WORK: 2              # give household routine somewhere to land (log-only)
 
 # --- Example: a driveway camera ------------------------------------------
 # Note how KNOWN_VEHICLE names the specific cars that belong here, so the model
@@ -65,10 +109,13 @@ driveway-cam:
     This is a driveway camera looking down the driveway toward the street. The
     gate across the driveway is usually closed.
     Choose the single best label:
-    UNFAMILIAR_VEHICLE (a vehicle that looks out of place or unexpected),
+    UNFAMILIAR_VEHICLE (a vehicle that looks out of place or unexpected -- any
+    vehicle that is NOT one of our two vehicles below, and is not a delivery or
+    mail vehicle; those are DELIVERY / MAIL_TRUCK),
     PERSON (a person on or near the driveway),
-    KNOWN_VEHICLE (an ordinary, expected, or already-parked vehicle, e.g. a
-    silver sedan or a red pickup truck that belong here),
+    KNOWN_VEHICLE (one of OUR two vehicles ONLY, e.g. the silver sedan or the
+    red pickup truck that belong here. Do NOT use this for any other vehicle,
+    even one that looks ordinary or is parked),
     DELIVERY (a package delivery in progress -- a UPS, FedEx, or Amazon van or
     truck, or a uniformed courier carrying or dropping off a package),
     MAIL_TRUCK (a USPS mail carrier or mail truck delivering ordinary mail),
@@ -84,6 +131,19 @@ driveway-cam:
   # single-frame model -- keep them log-only until you've reviewed the results.
   alert_on: ["UNFAMILIAR_VEHICLE", "PERSON", "DELIVERY"]
   notify_cooldown_sec: 1800
+  risk:
+    multiplier: 1.2             # on the property, but lots of household traffic
+    label_weights:
+      LOOKING_IN: 40
+      UNFAMILIAR_VEHICLE: 25
+      PERSON: 12                # repeats escalate; one sighting doesn't
+      MULTIPLE_PEOPLE: 12
+      AT_NIGHT_PERSON: 12
+      GATE_OPEN: 8
+      VEHICLE_ARRIVING: 6
+      VEHICLE_LEAVING: 4
+      DELIVERY: 5
+      MAIL_TRUCK: 2
 
 # --- Example: an inside-the-garage camera --------------------------------
 garage-cam:
@@ -105,6 +165,13 @@ garage-cam:
   # be logged without alerting. VEHICLE_MISSING is experimental (counting).
   alert_on: ["PERSON", "DOOR_OPEN"]
   notify_cooldown_sec: 1800
+  risk:
+    multiplier: 1.5             # interior space -- anything odd matters more
+    label_weights:
+      VEHICLE_MISSING: 20
+      PERSON: 12
+      GARAGE_OPEN_NIGHT: 12     # low base weight; the night multiplier escalates it
+      DOOR_OPEN: 6              # mostly household comings and goings
 
 # --- Example: a back patio / sliding-door camera (with a known pet) -------
 # You can give the model a label for a specific known subject (e.g. a pet) and
@@ -129,6 +196,16 @@ patio-cam:
   # REX is intentionally omitted from alert_on: logged, never emails.
   alert_on: ["PERSON_AT_DOOR", "LOITERING", "ANIMAL"]
   notify_cooldown_sec: 300
+  risk:
+    multiplier: 1.5             # back of house -- higher-signal than the street side
+    label_weights:
+      LOOKING_IN: 40
+      LOITERING: 25
+      PERSON_AT_DOOR: 12        # household traffic; repeats escalate
+      MULTIPLE_PEOPLE: 12
+      AT_NIGHT_PERSON: 12
+      ANIMAL: 4
+      REX: 0                    # the known pet -- never scores
 
 # --- Example: an indoor utility/laundry camera, leak & smoke watch --------
 utility-cam:
@@ -143,3 +220,10 @@ utility-cam:
     Then briefly describe what you see.
   alert_on: ["WATER_ON_FLOOR", "APPLIANCE_LEAK", "SMOKE_OR_HAZE"]
   notify_cooldown_sec: 1800
+  risk:
+    multiplier: 1.0
+    label_weights:              # hazards, not intruders: one frame goes straight high
+      SMOKE_OR_HAZE: 80         # URGENT immediately
+      WATER_ON_FLOOR: 55        # ELEVATED immediately
+      APPLIANCE_LEAK: 50        # ELEVATED immediately
+      PERSON: 0                 # household doing laundry

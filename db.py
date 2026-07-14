@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS events (
     latency_ms     INTEGER,            -- how long Ollama took
     image_path     TEXT,
     alerted        INTEGER NOT NULL DEFAULT 0,  -- 1 if we sent a notification
-    note           TEXT                -- e.g. "cooldown", "no-match", "error: ..."
+    note           TEXT,               -- e.g. "cooldown", "no-match", "error: ..."
+    risk_delta     REAL,               -- points this event added (audit only)
+    risk_score     REAL,               -- decayed total at event time (audit only)
+    risk_tier      TEXT                -- tier at event time (audit only)
 );
 CREATE INDEX IF NOT EXISTS idx_events_cam_alerted
     ON events (camera, alerted, ts_epoch);
@@ -49,8 +52,21 @@ def connect(db_file: Path | None = None) -> sqlite3.Connection:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after a DB was first created."""
     existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    added = False
     if "description" not in existing:
         conn.execute("ALTER TABLE events ADD COLUMN description TEXT")
+        added = True
+    # Risk-scoring audit columns (written at classification time, never read
+    # back for decisions -- the score is recomputed from the event log).
+    for col, sql_type in (
+        ("risk_delta", "REAL"),
+        ("risk_score", "REAL"),
+        ("risk_tier", "TEXT"),
+    ):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {col} {sql_type}")
+            added = True
+    if added:
         conn.commit()
 
 
@@ -64,6 +80,10 @@ def log_event(
     image_path: str | None,
     alerted: bool,
     note: str | None = None,
+    *,
+    risk_delta: float | None = None,
+    risk_score: float | None = None,
+    risk_tier: str | None = None,
 ) -> None:
     """Record one classification (or failure) and commit it."""
     now = time.time()
@@ -71,8 +91,9 @@ def log_event(
         """
         INSERT INTO events
             (ts_iso, ts_epoch, camera, classification, description,
-             raw_response, latency_ms, image_path, alerted, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             raw_response, latency_ms, image_path, alerted, note,
+             risk_delta, risk_score, risk_tier)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
@@ -85,9 +106,24 @@ def log_event(
             image_path,
             1 if alerted else 0,
             note,
+            risk_delta,
+            risk_score,
+            risk_tier,
         ),
     )
     conn.commit()
+
+
+def recent_events(
+    conn: sqlite3.Connection, since_epoch: float
+) -> list[tuple[str, str | None, float]]:
+    """(camera, classification, ts_epoch) for every event since the given
+    epoch, oldest first -- the risk scorer's input window (all cameras)."""
+    return conn.execute(
+        "SELECT camera, classification, ts_epoch FROM events"
+        " WHERE ts_epoch >= ? ORDER BY ts_epoch",
+        (since_epoch,),
+    ).fetchall()
 
 
 def last_alert_epoch(conn: sqlite3.Connection, camera: str) -> float:

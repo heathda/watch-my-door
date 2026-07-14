@@ -10,10 +10,10 @@ import db
 CONFIG = {"testcam": {"prompt": "p", "alert_on": ["OPEN"], "notify_cooldown_sec": 1000}}
 
 
-def run_main(monkeypatch, cam, image, *, classify_ret, email_ret=True):
+def run_main(monkeypatch, cam, image, *, classify_ret, email_ret=True, config=CONFIG):
     """Invoke main() with mocked classify/send_email; return recorded emails."""
     monkeypatch.setattr(cam_watcher, "ALERT_IMAGE_DIR", "")  # determinism
-    monkeypatch.setattr(cam_watcher, "load_config", lambda: CONFIG)
+    monkeypatch.setattr(cam_watcher, "load_config", lambda: config)
     monkeypatch.setattr(cam_watcher, "classify", lambda prompt, b64: classify_ret)
 
     emails = []
@@ -71,6 +71,38 @@ def test_cooldown_suppresses_second_alert(monkeypatch, temp_db, sample_image):
     r = rows()
     assert r[0][2] == 1               # first alerted
     assert r[1][2] == 0 and r[1][3] == "cooldown"
+
+
+def test_risk_shadow_mode_logs_score_without_changing_behavior(monkeypatch, temp_db, sample_image):
+    config = {
+        "_risk": {
+            "half_life_sec": 600,
+            "window_sec": 7200,
+            "repeat_dampening": 0.5,
+            "tiers": {"QUIET": 0, "NOTICE": 20, "ELEVATED": 50},
+        },
+        "testcam": {
+            "prompt": "p", "alert_on": ["OPEN"], "notify_cooldown_sec": 1000,
+            "risk": {"multiplier": 1.0, "label_weights": {"OPEN": 25}},
+        },
+    }
+    emails = run_main(monkeypatch, "testcam", sample_image,
+                      classify_ret=("OPEN\nx", 10), config=config)
+    assert len(emails) == 1  # alerting behavior unchanged by risk config
+    row = db.connect().execute(
+        "SELECT risk_delta, risk_score, risk_tier, alerted FROM events"
+    ).fetchone()
+    assert row == (25.0, 25.0, "NOTICE", 1)
+
+    # Second event moments later: dampened repeat (~+12.5), score rises, and
+    # the cooldown still suppresses -- shadow mode takes no action.
+    emails = run_main(monkeypatch, "testcam", sample_image,
+                      classify_ret=("OPEN\nx", 10), config=config)
+    assert emails == []
+    _, score, tier, note = db.connect().execute(
+        "SELECT risk_delta, risk_score, risk_tier, note FROM events ORDER BY id DESC"
+    ).fetchone()
+    assert note == "cooldown" and tier == "NOTICE" and 25.0 < score < 37.5
 
 
 def test_failed_email_does_not_start_cooldown(monkeypatch, temp_db, sample_image):
