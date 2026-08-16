@@ -70,14 +70,11 @@ invocations is read back out of `events.db` on the next run.
   somewhere to land. The custom `cam-watcher` model bakes a terse system prompt and
   `temperature 0.1` into a `Modelfile`; the base must be **vision-capable** (a
   text-only model silently ignores the image).
-- **Risk tiering: the score is *derived*, never stored.** A rolling risk score
-  (currently shadow mode — logged, not yet acting) turns isolated frames into
-  escalation: each event adds label-weight × camera × time-of-day points, and the
-  total decays exponentially when things go quiet. There is no running-level
-  state anywhere — the score is recomputed from the recent event log on every
-  run, the same pattern as the cooldown. The LLM **never** produces the score;
-  it would hallucinate non-reproducible numbers. See
-  [Risk tiering](#risk-tiering-shadow-mode) below.
+- **Derived state, not stored state.** Both the cooldown and the risk score are
+  recomputed from the event log rather than kept in a running variable — nothing
+  to drift, nothing to corrupt, and history stays replayable. The LLM never
+  produces the score; it would hallucinate non-reproducible numbers. See
+  [Risk tiering](#risk-tiering-shadow-mode).
 
 ### How the model answers
 
@@ -95,37 +92,20 @@ deterministic even though the description is free-form.
 
 ## Risk tiering (shadow mode)
 
-Isolated alerts miss patterns: one person on one camera is routine, but the
-same few minutes producing *loitering out front, a person on the driveway, and
-a person at the back door* is someone moving around the property. Risk tiering
-scores that.
+One person on one camera is routine. The same few minutes producing *loitering
+out front, a person on the driveway, and a person at the back door* is someone
+moving around the property. A rolling score turns isolated frames into that
+pattern: every event adds `label weight × camera × night` points, and the total
+decays exponentially when things go quiet (half-life ~10 min), mapping to
+`QUIET / NOTICE / ELEVATED / URGENT`.
 
-```
-score(now) = Σ over recent events:  weight(label) × camera_mult × night_mult
-                                    × repeat_dampening^rank
-                                    × 0.5 ^ (age / half_life)
-```
+It is **derived, never stored** — recomputed from the recent event log on every
+run, so there is no state to drift and history stays replayable. Currently
+**shadow mode**: the score and tier are logged beside each event, alerting is
+unchanged. Knobs live in `cameras.yaml` (`_risk` globally, `risk` per camera).
 
-- **Every event adds points; silence decays them** (half-life ~10 min). Blips
-  fade, patterns escalate. Score ranges map to tiers
-  (`QUIET / NOTICE / ELEVATED / URGENT`).
-- **Pure function of the event log.** The decayed sum is mathematically
-  identical to keeping a running level, but with no mutable state to drift or
-  corrupt — and it makes history **replayable**. The `risk_*` columns written
-  to `events.db` are an audit trail, never read back for decisions.
-- **Repeat dampening** (found during calibration, see war stories): the newest
-  event of each camera+label counts in full; each older repeat counts half
-  again. Distinct signals stack; re-observing one open garage door does not.
-- **Night labels are deliberately light.** `AT_NIGHT_PERSON`-style labels get
-  LOW base weights and the ×3 night multiplier does the escalating — a daytime
-  mislabel stays QUIET, a real 2 a.m. hit lands ELEVATED in one frame.
-- All knobs live in `cameras.yaml`: a global `_risk` block (half-life, window,
-  dampening, night hours, tier thresholds) + a per-camera `risk` block
-  (multiplier, label weights). No `_risk` block = feature off.
-
-Currently **shadow mode**: every event's score/tier is logged alongside it,
-but alerting is unchanged while the tiers are validated against reality. Tune
-against your own history without re-running the vision model:
+→ **[DESIGN-NOTES.md](DESIGN-NOTES.md#risk-tiering)** for the formula, repeat
+dampening, and why the LLM never produces the score.
 
 ```bash
 python replay.py                     # tier distribution + top episodes
@@ -133,63 +113,75 @@ python replay.py --config alt.yaml   # A/B experimental weights vs. the same his
 python replay.py --tier ELEVATED     # list every moment at/above a tier
 ```
 
-## War stories / lessons learned
+`replay.py` tunes **weights** by re-scoring labels already in the log. It is
+structurally blind to a **prompt** change, which alters which labels get
+produced at all — that needs the original frames and a second pass through the
+model, which is `ab_prompt.py`:
 
-The non-obvious issues that come with wiring an LLM into a Windows NVR — some hit
-in practice, one headed off by design. The kind of thing that doesn't show up in a
-unit test.
+```bash
+# same frames, two prompts, diff the labels (run where the JPEGs live)
+python ab_prompt.py --a cameras-baseline.yaml --b cameras.yaml --camera driveway-cam --limit 40
+python ab_prompt.py --b cameras.yaml --stored-as-a --camera driveway-cam   # half the model calls
+```
 
-- **`&ALERT_PATH` sometimes arrives as a bare filename.** Alerts were logged as
-  "image not found" even though BlueIris clearly passed *something*. Depending on
-  BlueIris version/settings, the `&ALERT_PATH` macro expands to just a filename
-  with no folder. Fix: `resolve_image()` tries the path as given, then falls back
-  to `ALERT_IMAGE_DIR / filename`. *Lesson: don't trust an upstream integration's
-  string format — degrade gracefully instead of assuming an absolute path.*
+## Watchdog: knowing the pipeline died
 
-- **Service accounts don't share your login's secret store (headed off by
-  design).** The Gmail App Password lives in **Windows Credential Manager, which is
-  per-user and DPAPI-encrypted**. BlueIris often runs under a *different* account
-  (e.g. `LocalSystem`) than the interactive user who'd naturally store the
-  credential — so an entry saved under your login would be invisible to the
-  service, and email would silently fail. This one was designed around rather than
-  gotten burned by: `notify.resolve_password()` documents storing the credential
-  under the account BlueIris actually runs as (`psexec -s -i` for `LocalSystem`),
-  with a `GMAIL_PASSWORD` env fallback. *Lesson: "works when I run it" and "works as
-  a service" are different questions — decide who owns the credential up front.*
+A system whose normal output is silence cannot tell you it stopped — two
+production outages passed unnoticed. `watchdog.py` runs from Task Scheduler
+every 5 minutes and checks staleness, error ratio, Ollama reachability, and
+disk. Two findings shaped it:
 
-- **A raw event sum scores frame count, not activity.** The first risk-scoring
-  calibration replayed two weeks of real events and produced 234 URGENT frames —
-  every one a household burst. BlueIris re-triggers motion every ~30 s during
-  sustained activity, so "sum the recent events" made *one garage door standing
-  open* look like twenty distinct signals. The fix wasn't smaller weights, it was
-  a different shape: **repeat dampening** (each older repeat of the same
-  camera+label counts half again). Same data, re-replayed: 11 URGENT frames, all
-  of them genuine multi-camera person sequences. *Lesson: when a score misbehaves,
-  ask what it's actually measuring — and replayable logs make the fix a
-  five-minute experiment instead of another two weeks of live tuning.*
+- **"No events" would have caught neither outage.** BlueIris kept firing and the
+  script kept logging — 931 rows in one day, every one an error. The
+  **error-ratio** check is what catches a dead model.
+- **A fixed silence threshold cannot work.** The p99 gap between events swings
+  **~30×** across the day, so the threshold is learned per hour-of-day from the
+  log itself.
 
-- **In the dark, the vision model guesses the alarming answer.** The driveway
-  gate label worked fine by day, then `GATE_OPEN_NIGHT` started firing almost
-  every night — 00:03, 01:35, 04:56 — while the gate sat closed. The tell was in
-  the descriptions: identical generic boilerplate ("The gate is open, allowing a
-  vehicle to drive through") with zero scene detail. In IR the model can't see
-  the latch, and a VLM never says "I can't see" — it picks something, and
-  "something" skews dramatic. Fix: an explicit uncertainty default in the prompt
-  *and* the system prompt ("if you cannot clearly see the condition, choose the
-  normal-state label — never pick the alarming option because you cannot see
-  clearly"). *Lesson: for any alert label, define what the model should say when
-  the evidence is invisible — otherwise it will hallucinate the interesting case,
-  and it will do it every night at 3 a.m.*
+It notifies on confirmed state change, and reads `events.db` read-only — a
+sidecar, never in the alert path.
 
-- **A hard-coded Python path in the `.bat` silently stopped the alerts.**
-  `cam_watcher.bat` pins a full path to `python.exe` (BlueIris runs under a service
-  account where `python` isn't on `PATH`). At one point that path was wrong and the
-  wrapper stopped launching the script — and because **BlueIris ignores the exit
-  code**, nothing surfaced the failure; the household's alerting just quietly went
-  dark until it was noticed. (The exact trigger is lost to history — it's a home
-  project, not a postmortem culture.) The roadmap response is a self-watchdog plus
-  Python auto-detection. *Lesson: a fire-and-forget integration needs a dead-man's
-  switch — silent success and silent failure look identical from the outside.*
+→ **[DESIGN-NOTES.md](DESIGN-NOTES.md#watchdog-knowing-the-pipeline-died)** for
+the threshold learning and the replay that sized the notification rate.
+
+```bash
+python watchdog.py --dry-run    # print the health report, never email
+python watchdog.py --force      # email it regardless of state (test the wiring)
+```
+
+## Lessons learned
+
+The non-obvious ways this project has broken — in production, in the tuning
+tools, and once caught just before shipping — each written up with what it cost
+and what generalizes → **[WAR-STORIES.md](WAR-STORIES.md)**.
+
+- Don't trust an upstream integration's string format — `&ALERT_PATH` is
+  sometimes a bare filename.
+- "Works when I run it" and "works as a service" are different questions —
+  decide who owns the credential up front.
+- When a score misbehaves, ask what it is *actually* measuring. A raw event sum
+  scored frame count, not activity: 234 URGENT frames, every one a household burst.
+- Define what the model should say when the evidence is invisible, or it will
+  invent the interesting case — nightly, at 3 a.m.
+- A new label that overlaps a scene you already see will break the label it
+  overlaps, and no rewording fixes it. Five versions, five failures, one dog-walker.
+- When your failure mode and your success mode write the same row, add the
+  column that tells them apart.
+- An A/B that samples a stochastic model once per item measures the sampler as
+  much as the change. Two prompts were rejected on disagreement rates that sat
+  *below* the live config's disagreement with itself.
+- A fire-and-forget integration needs a dead-man's switch — silent success and
+  silent failure look identical from the outside.
+- When a model is unreliable at *describing* something, don't assume it is
+  unreliable at *deciding* about it. A vehicle-identity check that asked for
+  colour and body type and compared them in code was measurably worse than one
+  that just asked "is this ours?" — same model, same frames, and its
+  descriptions stayed wrong while its verdicts were right.
+- A capability can be missing from a fifteen-label prompt and present in a
+  one-question prompt. If a rule inside a big prompt never seems to run, try
+  asking it on its own before rewording it a seventh time.
+- A verification step that can itself fail is worse than none — and strictly
+  worse when it runs *after* the irreversible part.
 
 ## Files
 
@@ -199,13 +191,20 @@ unit test.
 | `notify.py` | Email sender (Gmail SMTP_SSL) with image attachment. |
 | `db.py` | SQLite event log; cooldown state derived from it. |
 | `risk.py` | Deterministic risk scoring (pure functions over the event log). |
-| `replay.py` | Re-score history under any config — the risk tuning tool. |
-| `review.py` | CLI view over `events.db` (recent events, label counts). |
-| `cameras.yaml` | Per-camera prompt / `alert_on` / cooldown / risk weights. **Add a camera here, not in code.** |
+| `replay.py` | Re-score history under any config — the **weight** tuning tool. |
+| `ab_prompt.py` | Run two configs over the same stored frames and diff the labels — the **prompt** tuning tool. `--frames-file` scores a hand-adjudicated corpus for accuracy rather than agreement. |
+| `vehicle_id.py` | Second-call vehicle identity check. The single-call prompt would not perform the known/unknown comparison at all, so when a frame gets a vehicle label the identity question is asked on its own. Off unless a camera sets `vehicle_check`. |
+| `watchdog.py` | Scheduled health check: is anything arriving, is it classifying, is Ollama up, is the disk full. |
+| `review.py` | CLI view over `events.db` (recent events, label counts, unrecognized labels). |
+| `labels.py` | Derives each camera's permitted labels from its own prompt, so a label the model invented can be flagged instead of silently dropped. |
+| `cameras.yaml` | Per-camera prompt / `alert_on` / cooldown / risk weights / watchdog thresholds. **Add a camera here, not in code.** |
 | `Modelfile` | Builds the `cam-watcher` Ollama model (terse, low-temp). |
 | `cam_watcher.bat` | BlueIris wrapper (Windows arg-passing workaround). |
+| `watchdog.bat` | Task Scheduler wrapper for the watchdog (every 5 min). |
 | `.env` | Secrets + endpoints (copy from `.env.example`). |
 | `events.db` | Auto-created SQLite log (gitignored). |
+| [`WAR-STORIES.md`](WAR-STORIES.md) | What went wrong in production, and what generalizes. |
+| [`DESIGN-NOTES.md`](DESIGN-NOTES.md) | Long-form reasoning: the risk score, the watchdog's learned thresholds. |
 
 ## Setup
 
@@ -278,26 +277,13 @@ the script.
   it against this folder. Find it via `ollama`-side search or BlueIris →
   Settings → Folders.
 - `OLLAMA_KEEP_ALIVE` — how long Ollama keeps the model warm in GPU memory after
-  an alert (default `30m`). See **Performance** below.
+  an alert (default `30m`).
 
-### Performance / latency
-
-Loading the ~8 GB model into the GPU takes ~7s, so in theory an alert that hits a
-cold (unloaded) model pays that reload on top of inference. Two knobs are meant to
-help:
-
-- **`OLLAMA_KEEP_ALIVE`** tells Ollama how long to keep the model resident after a
-  request — the intent being that sparse motion alerts don't each trigger a reload.
-  `30m` is the default here; `-1` keeps it warm *forever* (holds the VRAM
-  permanently and blocks other large models from loading alongside it); the box's
-  own idle default may be just seconds, which this per-request value overrides.
-  **In practice, tuning this didn't meaningfully change per-alert latency in my
-  setup** — end-to-end time was acceptable either way, so the root cause was never
-  chased down. Treat it as a reasonable knob to try, not a proven fix.
-- **GPU vs CPU** — run `ollama ps` on the box; you want `100% GPU`. If it shows
-  CPU offload, the model doesn't fit in VRAM (free some by removing unused
-  models) — that's when latency really hurts. Fully on GPU, the alert-image
-  resolution costs only a second or two, so don't shrink it.
+**On latency:** run `ollama ps` and confirm `100% GPU`. If it shows CPU offload,
+the model doesn't fit in VRAM and that is where the time goes — free some by
+removing unused models. Fully on GPU, alert-image resolution costs a second or
+two, so don't shrink it. → [DESIGN-NOTES.md](DESIGN-NOTES.md#latency-and-the-keep-alive-knob)
+on why `OLLAMA_KEEP_ALIVE` is a knob to try rather than a proven fix.
 
 ### 3. BlueIris configuration
 
@@ -346,11 +332,30 @@ it **out** of `alert_on` — that's the routine path for the majority of frames.
 Risk scoring's global knobs (half-life, night window, tier thresholds) live in
 the `_risk` block at the top of the file — see `cameras.yaml.example`.
 
+**Measure a prompt change before you ship it.** Reading a prompt does not tell
+you what it does; four of five prompt revisions in one session read fine and
+made things worse, two of them on alerting paths. The workflow that catches it:
+
+```bash
+cp cameras.yaml cameras-v1-YYYYMMDD.yaml         # snapshot the known-good config
+$EDITOR cameras.yaml                             # make the change
+python -m pytest -q                              # config validation
+python ab_prompt.py --a cameras-v1-YYYYMMDD.yaml --b cameras.yaml \
+    --camera front-cam --since "..." --limit 0   # same frames, both prompts
+```
+
+Then **read only the disagreements — and open the JPEG.** Every verdict reached
+from the prompt text or the model's own description alone was later overturned
+by looking at the actual frame. A new label goes into the prompt but stays out
+of `alert_on` until the A/B shows it behaving. `cameras.yaml.example` opens with
+four prompt rules, each one learned from a specific failure in the log.
+
 ## Inspecting the log
 
 ```bash
 python review.py                 # last 25 events, all cameras
 python review.py --counts        # label frequency per camera
+python review.py --unknown       # labels no prompt defines -- these can never alert
 sqlite3 events.db "SELECT ts_iso, camera, classification, risk_score, risk_tier, alerted, note FROM events ORDER BY id DESC LIMIT 20;"
 ```
 

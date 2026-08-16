@@ -30,7 +30,9 @@ import yaml
 from dotenv import load_dotenv
 
 import db
+import labels
 import risk
+import vehicle_id
 from notify import send_email
 
 SCRIPT_DIR = Path(__file__).parent
@@ -98,6 +100,19 @@ def parse_answer(raw: str) -> tuple[str, str]:
     inline = parts[1].strip() if len(parts) > 1 else ""
     description = " ".join(p for p in (inline, rest.strip()) if p).strip()
     return label, description
+
+
+def _note(base: str | None, unknown: bool, extra: str | None = None) -> str | None:
+    """Compose the log note from its independent parts.
+
+    Each part answers a different question and all of them can be true at once:
+    `extra` is what the vehicle identity check did, `unknown-label` flags a label
+    the prompt never defined, and `base` is why we did or didn't email
+    ('no-match', 'cooldown'). Joined rather than replaced, because dropping any
+    one of them loses the only record that it happened.
+    """
+    parts = [p for p in (extra, "unknown-label" if unknown else None, base) if p]
+    return "; ".join(parts) or None
 
 
 def classify(prompt: str, img_b64: str) -> tuple[str | None, int]:
@@ -190,6 +205,36 @@ def main() -> None:
     label, description = parse_answer(raw)
     logger.info(f"[{cam}] {label} -- {description} ({latency_ms} ms)")
 
+    # A label the prompt never defined can't match alert_on, so it would be
+    # logged and dropped without a trace -- indistinguishable from a frame that
+    # correctly didn't alert. Flag it in the note instead. We still process the
+    # event normally: the substring match below may yet fire (e.g. an invented
+    # PERSON_ON_PROPERTY contains PERSON), and suppressing that would turn a
+    # cosmetic problem into a missed alert.
+    # Second-call identity check. Only fires when call 1 returned a vehicle
+    # label, so an empty driveway -- ~85% of this camera's frames -- costs
+    # nothing extra. It can only swap one vehicle label for the other, and it
+    # keeps call 1's answer on any doubt. See vehicle_id.py for why the
+    # comparison lives in Python instead of in the prompt.
+    id_check = vehicle_id.identify(label, cfg, img_b64, classify)
+    if id_check["ran"]:
+        latency_ms += id_check["latency_ms"]
+        if id_check["label"] != label:
+            logger.info(
+                f"[{cam}] identity check: {label} -> {id_check['label']} "
+                f"({id_check['note']})"
+            )
+            label = id_check["label"]
+        else:
+            logger.info(f"[{cam}] identity check: kept {label} ({id_check['note']})")
+
+    unknown = labels.is_unknown(label, cfg["prompt"])
+    if unknown:
+        logger.warning(
+            f"[{cam}] '{label}' is not a label this prompt defines -- "
+            f"check the prompt (see review.py --unknown)"
+        )
+
     # Risk scoring (shadow mode): compute and log the rolling score, but take
     # no action on it yet. The score is a pure function of the recent event
     # log, so it needs no stored state -- see risk.py.
@@ -213,7 +258,7 @@ def main() -> None:
     if not is_match:
         db.log_event(
             conn, cam, label, description, raw, latency_ms, image_path,
-            alerted=False, note="no-match", **risk_kw,
+            alerted=False, note=_note("no-match", unknown, id_check["note"]), **risk_kw,
         )
         return
 
@@ -224,7 +269,7 @@ def main() -> None:
         logger.info(f"[{cam}] '{label}' suppressed (cooldown {cooldown}s)")
         db.log_event(
             conn, cam, label, description, raw, latency_ms, image_path,
-            alerted=False, note="cooldown", **risk_kw,
+            alerted=False, note=_note("cooldown", unknown, id_check["note"]), **risk_kw,
         )
         return
 
@@ -236,7 +281,7 @@ def main() -> None:
     )
     db.log_event(
         conn, cam, label, description, raw, latency_ms, image_path,
-        alerted=sent, note=None if sent else "email failed", **risk_kw,
+        alerted=sent, note=_note(None if sent else "email failed", unknown, id_check["note"]), **risk_kw,
     )
 
 

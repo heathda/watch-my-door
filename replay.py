@@ -14,12 +14,20 @@ Usage:
     python replay.py --db other.db       # score a different event log
     python replay.py --top 10            # show the N highest-scoring moments
     python replay.py --tier NOTICE       # list every event at/above a tier
+    python replay.py --since 2026-07-26  # only score from a date onward
+
+A prompt change alters which labels get produced at all, so history either side
+of one is two different label distributions and averaging them hides both.
+--since restricts the *report* to events at/after the cutoff while still
+loading one window's worth of earlier events, so the first events after the
+cutoff are scored against the same history cam_watcher saw.
 
 Reads only; never writes to the database.
 """
 
 import argparse
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -28,11 +36,30 @@ import db
 import risk
 
 
-def load_events(conn):
-    """Every event, oldest first: (ts_iso, ts_epoch, camera, label, alerted)."""
+def parse_since(text: str) -> float:
+    """'YYYY-MM-DD', 'YYYY-MM-DD HH:MM' or '...:SS' -> local epoch (ts_epoch
+    is local-time epoch, so strptime().timestamp() matches it)."""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            continue
+    raise SystemExit(f"--since: cannot parse {text!r} (use 'YYYY-MM-DD[ HH:MM[:SS]]')")
+
+
+def load_events(conn, from_epoch: float | None = None):
+    """Every event, oldest first: (ts_iso, ts_epoch, camera, label, alerted).
+    from_epoch loads only events at/after it -- pass the cutoff minus one
+    window so the first reported event still has its history to decay."""
+    if from_epoch is None:
+        return conn.execute(
+            "SELECT ts_iso, ts_epoch, camera, classification, alerted"
+            " FROM events ORDER BY ts_epoch"
+        ).fetchall()
     return conn.execute(
         "SELECT ts_iso, ts_epoch, camera, classification, alerted"
-        " FROM events ORDER BY ts_epoch"
+        " FROM events WHERE ts_epoch >= ? ORDER BY ts_epoch",
+        (from_epoch,),
     ).fetchall()
 
 
@@ -60,6 +87,9 @@ def main() -> None:
     ap.add_argument("--db", default=None, help="events database (default: events.db)")
     ap.add_argument("--top", type=int, default=5, help="highest-scoring moments to show")
     ap.add_argument("--tier", default=None, help="list every event at/above this tier")
+    ap.add_argument(
+        "--since", default=None, help="only report events at/after 'YYYY-MM-DD[ HH:MM]'"
+    )
     args = ap.parse_args()
 
     config = yaml.safe_load(Path(args.config).read_text()) or {}
@@ -67,10 +97,15 @@ def main() -> None:
         print(f"{args.config} has no _risk block -- nothing to score.")
         return
 
+    since = parse_since(args.since) if args.since else None
+    window = float((risk.risk_config(config) or {}).get("window_sec", risk.DEFAULT_WINDOW_SEC))
+
     conn = db.connect(Path(args.db) if args.db else None)
-    scored = list(rescore(load_events(conn), config))
+    # Load one window before the cutoff as warm-up; report only at/after it.
+    events = load_events(conn, since - window if since is not None else None)
+    scored = [s for s in rescore(events, config) if since is None or s[1] >= since]
     if not scored:
-        print("No events in the database.")
+        print("No events in the database." if since is None else f"No events since {args.since}.")
         return
 
     tiers = (risk.risk_config(config) or {}).get("tiers", {})

@@ -26,9 +26,8 @@
 # for a while, then promote the accurate ones into alert_on once you trust them.
 #
 # GOTCHA -- alert_on matches by SUBSTRING. A label that CONTAINS an alerting
-# token will itself alert. e.g. if "DOOR_OPEN" is in alert_on, a label named
-# "DOOR_OPEN_AT_NIGHT" also fires. Name log-only variants so they don't overlap
-# (this example uses "GARAGE_OPEN_NIGHT", not "DOOR_OPEN_AT_NIGHT").
+# token will itself alert: with "DOOR_OPEN" in alert_on, a label named
+# "DOOR_OPEN_PARTIAL" fires too. Name log-only variants so they don't overlap.
 #
 # RISK SCORING (optional, shadow mode) -- the `_risk` block below plus each
 # camera's `risk` block drive a rolling risk score: every event adds
@@ -39,10 +38,84 @@
 # weights against your own history with:  python replay.py
 # Delete the `_risk` block to turn the feature off entirely.
 
+# ==========================================================================
+# FOUR PROMPT RULES, EACH LEARNED THE HARD WAY FROM ~32k REAL CLASSIFICATIONS
+# ==========================================================================
+#
+# 1. STATE LOSES TO IDENTITY -- so state the priority explicitly.
+#    A condition visible in EVERY frame (a gate open/closed, a garage door
+#    up/down) will beat a person or vehicle present in 4% of frames, because
+#    "choose the single best label" invites the model to answer the question it
+#    can always answer. Adding three gate labels to a driveway camera here took
+#    GATE_CLOSED from 68 to 1,576 hits per week and drove UNFAMILIAR_VEHICLE to
+#    ZERO in 7,217 frames -- strangers' cars in the driveway were logged as
+#    "the gate is closed". Every prompt below that mixes scene state with
+#    occupancy opens with a PRIORITY RULE saying which wins.
+#
+# 2. NEVER ASK A SUBJECTIVE QUESTION. "a vehicle that looks out of place or
+#    unexpected" is not a test the model can apply -- it reasoned its way to
+#    NONE on parked strangers' cars, describing "no vehicles that stand out as
+#    unusual". Identity checks must be objective and checkable from the pixels:
+#    is it THAT car (this color, this body type), yes or no.
+#
+# 2b. ...AND STATE IT POSITIVELY. Fixing rule 2 by leaning hard the other way
+#    ("do NOT ask whether it looks ordinary; use UNFAMILIAR even if it looks
+#    unremarkable") produced the exact inverse bug within one attempt: the
+#    model correctly read "a white pickup truck" and labeled it
+#    UNFAMILIAR_VEHICLE anyway, in 6 of 40 frames -- alerting on the household's
+#    own truck. Negative definitions ("NOT the white truck") are the phrasing
+#    models follow worst. Define the KNOWN case positively, make unfamiliar the
+#    residual, and send genuine uncertainty to the QUIET side:
+#        is it a white pickup or a black SUV?  yes -> KNOWN, no -> UNFAMILIAR,
+#        can't tell -> KNOWN (never alarm because you couldn't see clearly)
+#    Corollary: a new label goes into the prompt but NOT into alert_on until
+#    ab_prompt.py shows it behaving. Both of these bugs were caught that way,
+#    on stored frames, before anyone was woken up.
+#
+# 2c. PRECEDENCE MUST BE A NUMBERED PROCEDURE, NOT PROSE. "State loses to
+#    identity" as a paragraph left the model to invent its own ordering among
+#    the occupancy labels, and it ranked a parked car above a human being
+#    ("A person is washing a white pickup" -> UNFAMILIAR_VEHICLE). An explicit
+#    "answer in this order, take the first that applies, stop there" fixed it.
+#    Same lesson as rule 1, one level down.
+#
+# 3. NO TIME-OF-DAY LABELS. Don't add AT_NIGHT_PERSON / *_NIGHT variants.
+#    risk.py already multiplies every event by the night multiplier using its
+#    timestamp, so a night label double-counts -- and in 28 days the model never
+#    once emitted AT_NIGHT_PERSON on any camera, so the escalation it was
+#    supposed to trigger never fired at all. The clock is the code's job; the
+#    model only reports what it can see.
+#
+# 4. A NEW LABEL MUST NOT OVERLAP A SCENE YOU ALREADY SEE OFTEN. Rules 1-3 are
+#    about how a label is WORDED. This one is about whether it should exist at
+#    all on a given camera, and no amount of rewording substitutes for it.
+#    Adding ANIMAL to a front-yard camera took five prompt versions and five
+#    A/B runs, and every one failed somewhere different: blind to people on the
+#    sidewalk; people placed on the property; both at once, including four
+#    frames labeled APPROACHING_HOUSE (alerting) whose own descriptions said
+#    "walking on the sidewalk, moving AWAY from the house"; and finally people
+#    dropped to NONE. One frame explained all four --
+#        NONE  "a person walking a dog on a leash. The person is on the
+#               sidewalk, and the dog..."
+#    ANIMAL meant "an animal with no person around it", and a dog-walker is a
+#    person AND an animal. The two labels competed for the same frame and the
+#    model answered neither. That yard has dog-walkers constantly; the BACK
+#    patio camera carries ANIMAL without trouble because nobody walks a dog
+#    across it. The label was dropped, not reworded.
+#    Before adding a label, grep the descriptions in events.db for the scene it
+#    covers. If it co-occurs with a label you already have, you are not adding
+#    a category -- you are splitting one, and both halves get less reliable.
+#    Corollary on scope: that whole exercise chased a COSMETIC defect (a cat
+#    logged as PASSING_BY, a log-only label that never emails). Decide what a
+#    fix is worth before the first rewrite, not after the fifth.
+#
+# A fifth, cheaper rule: end every prompt with "Use ONLY the labels listed
+# above" -- without it the model occasionally invents one (BIRD_FLYING,
+# MOWING_LAWN), and an invented label can never match alert_on. Audit for them
+# with `python review.py --unknown`; cam_watcher tags them "unknown-label" in
+# events.db as they happen.
+
 # --- Risk scoring (global) ------------------------------------------------
-# TIP: give night-flavored labels (AT_NIGHT_PERSON, GARAGE_OPEN_NIGHT, ...)
-# LOW base weights and let the night multiplier escalate them -- then a
-# daytime mislabel stays quiet while a real 2am hit lands high immediately.
 _risk:
   half_life_sec: 600            # a lone blip loses half its weight in 10 min
   window_sec: 7200              # events older than 2 h can't move the score
@@ -52,40 +125,97 @@ _risk:
   night:
     start: "22:00"
     end: "06:00"
-    multiplier: 3.0
+    multiplier: 3.0             # applied to every label by timestamp -- this is
+                                # the ONLY place time of day enters the score
   tiers:                        # lower bound -> tier name
     QUIET: 0                    # log only
     NOTICE: 20                  # email
     ELEVATED: 50                # email, flagged subject (planned)
     URGENT: 80                  # urgent channel (planned)
 
+# --- Pipeline self-watchdog (optional) ------------------------------------
+# Run watchdog.py on a schedule (Task Scheduler, every 5 min). Without it,
+# nothing tells you the pipeline died -- silence is this system's normal
+# output, so a dead Ollama and a quiet afternoon look identical. Delete this
+# block to disable. Every value below is optional; defaults live in
+# watchdog.py DEFAULTS and are merged under whatever you set here.
+_watchdog:
+  enabled: true
+  stale:                        # nothing arriving at all
+    floor_min: 45               # never alarm before 45 min of silence by day
+    night_floor_min: 180        # ...or 3 h inside the _risk night window, where
+                                # "quiet house" and "dead pipeline" look alike
+    multiplier: 2.5             # or 2.5x the p99 gap normal for THIS hour of
+                                # day, learned from your own log -- event rates
+                                # swing ~40x between 3am and noon, so a single
+                                # fixed threshold cannot work
+    ceiling_min: 240            # cap: also the longest gap the learner will
+                                # absorb, so a past outage can't teach it to
+                                # sleep through the next one
+    history_days: 14
+    min_samples: 30             # below this, fall back to the floor
+  errors:                       # arriving but not classifying
+    window_min: 30              # THIS is the check that catches a dead model:
+    min_events: 5               # events keep flowing and every one fails, so a
+    max_fail_ratio: 0.5         # silence check sees a healthy rate and shrugs
+  ollama:
+    timeout_sec: 5
+    check_model: true           # also verify OLLAMA_MODEL is actually loaded --
+                                # a renamed model looks just like a dead network
+  disk:
+    min_free_gb: 5
+  notify:
+    renotify_min: 180           # an ongoing outage repeats at most every 3 h;
+                                # at a 5-minute cadence an untamed watchdog
+                                # sends 84 emails per outage and trains you to
+                                # ignore it
+    recovery: true              # ...and says when it comes back
+
 # --- Example: a front-of-house / entry camera ----------------------------
 # Describe the scene concretely (near/far, entry points, which way is "toward
 # the house") -- the model classifies far better with a spatial mental map.
+# Note the PRIORITY RULE: without it, a catch-all like PASSING_BY quietly
+# swallows people who are actually on your property.
 front-cam:
   prompt: >
     This is a front-yard / entry camera. The house is on the near side, behind
     the front landscaping. A walkway runs from the driveway to the porch, where
     the front door is (a house entry point). The street is on the far side --
     a person moving toward the street is moving away from the house.
+
+    PRIORITY RULE, read before choosing: if a person is ON THE PROPERTY -- in
+    the yard, on the walkway, on the porch, or in the driveway -- they are NOT
+    just passing by. Choose PASSING_BY only for someone on the public sidewalk
+    or the street, or a vehicle on the street.
+
     Choose the single best label for the main activity:
-    LOITERING (a person lingering with no clear purpose -- NOT someone doing
-    yard work; that is YARD_WORK),
+    APPROACHING (a person on the walkway, on the porch, or standing at the front
+    door, or a person in the yard or driveway moving toward the house. Anyone
+    who has left the sidewalk and is headed toward the house belongs here,
+    including a visitor who looks perfectly ordinary),
+    LOITERING (a person who is on the property but not going anywhere --
+    standing or wandering with no apparent task -- NOT someone doing yard work;
+    that is YARD_WORK),
+    LOOKING_IN (a person with their face close to a window or the front-door
+    glass, hands cupped against the glass or shielding their eyes to see inside,
+    or a person standing still at close range facing the camera directly),
     YARD_WORK (a person doing routine yard or house maintenance -- watering,
-    mowing, gardening, trimming, or taking out bins),
-    APPROACHING (a person moving toward the house, porch, or front door),
-    PASSING_BY (a person or vehicle simply passing along the sidewalk or street;
-    someone in the driveway is NOT just passing by),
+    mowing, gardening, trimming, sweeping, or taking out bins),
+    PASSING_BY (a person on the public sidewalk, or a vehicle on the street,
+    simply moving past. Someone in the yard, on the walkway, on the porch, or in
+    the driveway is NOT passing by),
     DELIVERY (a package delivery in progress -- a UPS, FedEx, or Amazon van or
     truck, or a uniformed courier carrying or dropping off a package),
     MAIL_TRUCK (a USPS mail carrier or mail truck delivering ordinary mail),
-    LOOKING_IN (a person peering into a window or staring directly at the camera),
     MULTIPLE_PEOPLE (a group of two or more people together),
-    AT_NIGHT_PERSON (a person present when it is clearly dark/nighttime),
-    NONE (nothing relevant visible).
-    Then briefly describe what you see.
-  # MAIL_TRUCK / LOOKING_IN / MULTIPLE_PEOPLE / AT_NIGHT_PERSON are logged only
-  # (left out of alert_on) until you've confirmed the model uses them well.
+    NONE (nothing relevant visible -- including an empty yard, weather, moving
+    shadows or sunlight, a bird, a cat, or a passing insect).
+
+    Use ONLY the labels listed above. Never invent a new label. Then briefly
+    describe what you see, and say where the person is (sidewalk, yard, walkway,
+    porch, driveway) whenever there is one.
+  # MAIL_TRUCK / LOOKING_IN / MULTIPLE_PEOPLE are logged only (left out of
+  # alert_on) until you've confirmed the model uses them well.
   alert_on: ["LOITERING", "APPROACHING", "DELIVERY"]
   notify_cooldown_sec: 300
   risk:
@@ -95,42 +225,135 @@ front-cam:
       LOITERING: 30
       APPROACHING: 20
       MULTIPLE_PEOPLE: 12
-      AT_NIGHT_PERSON: 12       # low base weight; the night multiplier escalates it
       DELIVERY: 5
       MAIL_TRUCK: 2
       PASSING_BY: 2             # routine, but twenty in ten minutes should register
       YARD_WORK: 2              # give household routine somewhere to land (log-only)
 
 # --- Example: a driveway camera ------------------------------------------
-# Note how KNOWN_VEHICLE names the specific cars that belong here, so the model
-# can tell them apart from an UNFAMILIAR_VEHICLE. Swap in your own vehicles.
+# This one demonstrates all three rules at once, because it is the camera that
+# taught them: an always-visible gate, a "does it belong here" question, and a
+# night variant. Swap in your own vehicles -- and describe them by COLOR and
+# BODY TYPE, which the model can actually check, not by whether they "belong".
 driveway-cam:
   prompt: >
-    This is a driveway camera looking down the driveway toward the street. The
-    gate across the driveway is usually closed.
+    This is a driveway camera looking down the driveway toward the street. A
+    gate crosses the driveway and is normally closed.
+
+    ANSWER IN THIS ORDER. Take the FIRST step that applies and stop there:
+    1. Is a person ON THE PROPERTY -- in the driveway, in the gateway, or on
+       the walkway to the house? Label the person, even if a vehicle is also in
+       the frame. A person washing, loading, or standing beside a car is still
+       a person. A person out on the PUBLIC sidewalk beyond the gate, or in the
+       street, or in a neighbor's yard, is NOT on the property -- ignore them
+       and continue to step 2.
+    2. Otherwise, is a vehicle in the driveway or moving through the gateway?
+       Identify the vehicle.
+    3. Otherwise the driveway is empty: report the gate's state. This is the
+       normal, expected answer for this camera.
+    4. Only if you genuinely cannot make out the driveway or the gate at all:
+       NONE.
+
+    IDENTIFYING A VEHICLE. Two vehicles live here: a SILVER sedan and a RED
+    pickup truck. Ask one question: is this vehicle a silver sedan, or a red
+    pickup? If YES it is KNOWN_VEHICLE -- ours, whatever it is doing: parked,
+    moving, doors open, dirty, or covered in soap. If NO -- any other color or
+    body type -- it is UNFAMILIAR_VEHICLE. If you cannot tell the color or body
+    type, choose KNOWN_VEHICLE; never raise an alarm because you could not see
+    clearly.
+
     Choose the single best label:
-    UNFAMILIAR_VEHICLE (a vehicle that looks out of place or unexpected -- any
-    vehicle that is NOT one of our two vehicles below, and is not a delivery or
-    mail vehicle; those are DELIVERY / MAIL_TRUCK),
-    PERSON (a person on or near the driveway),
-    KNOWN_VEHICLE (one of OUR two vehicles ONLY, e.g. the silver sedan or the
-    red pickup truck that belong here. Do NOT use this for any other vehicle,
-    even one that looks ordinary or is parked),
+    PERSON (a person in the driveway, in the gateway, or on the walkway to the
+    house, whatever else is in the frame. NOT someone out on the public
+    sidewalk or in the street -- a front-of-house camera covers those),
+    MULTIPLE_PEOPLE (two or more people together),
+    LOOKING_IN (a person with their face close to a window or vehicle glass,
+    hands cupped against it, or standing still at close range facing the camera),
     DELIVERY (a package delivery in progress -- a UPS, FedEx, or Amazon van or
     truck, or a uniformed courier carrying or dropping off a package),
     MAIL_TRUCK (a USPS mail carrier or mail truck delivering ordinary mail),
-    GATE_OPEN (the driveway gate is open or partly open),
-    VEHICLE_ARRIVING (a vehicle moving toward the house/driveway),
-    VEHICLE_LEAVING (a vehicle moving away, toward the street),
-    LOOKING_IN (a person peering into a window/vehicle or staring at the camera),
-    MULTIPLE_PEOPLE (a group of two or more people together),
-    AT_NIGHT_PERSON (a person present when it is clearly dark/nighttime),
-    NONE (nothing relevant visible).
-    Then briefly describe what you see.
-  # Direction (ARRIVING/LEAVING) and counting (MULTIPLE_PEOPLE) are harder for a
-  # single-frame model -- keep them log-only until you've reviewed the results.
+    KNOWN_VEHICLE (our silver sedan or our red pickup, in the driveway, with no
+    person visible. Name its color and body type in your description),
+    UNFAMILIAR_VEHICLE (a vehicle in the driveway or gateway that is neither a
+    silver sedan nor a red pickup -- for example a black, white, blue, or gray
+    car, an SUV, or a van -- with no person visible. Name its color and body
+    type in your description),
+    GATE_CLOSED (the driveway is empty and the gate is shut, blocking the
+    driveway -- the normal state, and the right answer for most frames. At night
+    or in infrared, if the gate position is uncertain, choose this),
+    GATE_OPEN (the driveway is empty and the gate is clearly open or partly
+    open, leaving a gap a vehicle could drive through. Not for a gate merely
+    seen at an angle, partially hidden, or in shadow),
+    NONE (you cannot make out the driveway or the gate at all -- glare,
+    obstruction, or total darkness. A vehicle out on the street, in a neighbor's
+    driveway, or parked in the distance beyond the gate is NOT in our driveway:
+    if our driveway itself is empty, use a gate label, not this).
+
+    Use ONLY the labels listed above. Never invent a new label. Then briefly
+    describe what you see. If a vehicle is present, always give its color and
+    body type and say whether it is parked, arriving, or leaving. If a person is
+    present, say where they are and what they are doing.
+  # KNOWN_VEHICLE is log-only by design -- it IS the known-entity allowlist:
+  # your own cars get recorded and never email you. Note there is no
+  # VEHICLE_ARRIVING / VEHICLE_LEAVING label: direction from a single still was
+  # never once produced in 7,217 frames, so motion goes in the description
+  # instead of costing two labels' worth of the model's attention.
+  #
+  # UNFAMILIAR_VEHICLE goes into alert_on only AFTER ab_prompt.py shows it
+  # calling your own cars KNOWN_VEHICLE across a day's frames. A
+  # vehicle-identity label is exactly the kind that reads as working until you
+  # measure it (rule 2b): the first attempt at this prompt alerted on the
+  # household's own truck 6 times in 40 frames. Start it log-only, measure,
+  # then promote -- and note that measuring "no false alarms" is not the same
+  # as measuring "detects a real stranger", which needs a stranger to show up.
   alert_on: ["UNFAMILIAR_VEHICLE", "PERSON", "DELIVERY"]
   notify_cooldown_sec: 1800
+
+  # --- vehicle_check: the second-call identity check (optional) -------------
+  # Absent block = off, which is the right default for a new camera.
+  #
+  # WHY IT EXISTS. On this project's real driveway camera UNFAMILIAR_VEHICLE
+  # fired 0 times in 57,948 events, and six prompt rewrites over three weeks did
+  # not change that. The measurement that explains it: the prompt was edited to
+  # claim the household cars were "a red sedan and a dark green hatchback", then
+  # shown a white pickup -- and the model still answered KNOWN_VEHICLE, in 47 of
+  # 48 draws. In a fifteen-label prompt the identity comparison is one clause
+  # among many and the model satisfices: KNOWN_VEHICLE becomes its word for "a
+  # vehicle is present". Deleting the "if you cannot tell, choose KNOWN_VEHICLE"
+  # fallback did not help either -- those frames became NONE.
+  #
+  # So ask the identity question BY ITSELF, in a second call, on the frames that
+  # already have a vehicle label. Measured: 4/4 correct on vehicles that were
+  # not ours, 5/5 correct on ones that were, 18/18 draws unanimous.
+  #
+  # DO NOT "improve" this by asking for colour and body type and comparing them
+  # in code. That was built first and measured worse: the household pickup came
+  # back "white suv" and, cropped, "silver sedan" -- both 4/4 unanimous -- and
+  # produced false alarms on the household's own truck. The same model gets the
+  # OURS/NOT-OURS verdict right while describing the vehicle wrongly. Ask for
+  # the decision, not for the evidence.
+  #
+  # COST: one extra call, only on frames whose first answer is in `triggers`.
+  # An empty driveway (~85% of frames here) pays nothing.
+  vehicle_check:
+    enabled: true
+    triggers: ["KNOWN_VEHICLE", "UNFAMILIAR_VEHICLE"]
+    # Must match how the camera prompt AND the prompt below describe your cars.
+    # test_config enforces that all three agree: drift is silent, and its
+    # symptom is an email about your own vehicle.
+    known: ["silver sedan", "red pickup"]
+    known_label: KNOWN_VEHICLE
+    unknown_label: UNFAMILIAR_VEHICLE
+    # Must ask for OURS / NOT-OURS -- that is all vehicle_id.py understands.
+    # The closing default is the 3am rule again: on doubt, say the calm thing.
+    prompt: >-
+      Two vehicles belong to this household: a SILVER SEDAN and a RED PICKUP
+      TRUCK (open cargo bed behind the cab). Look at the vehicle on the driveway
+      nearest the camera. Ignore any vehicle out in the street or in a driveway
+      across the street. Is it one of those two? Answer exactly OURS or
+      NOT-OURS, then in three words say what you see. If you cannot see it well
+      enough, answer OURS.
+
   risk:
     multiplier: 1.2             # on the property, but lots of household traffic
     label_weights:
@@ -138,63 +361,91 @@ driveway-cam:
       UNFAMILIAR_VEHICLE: 25
       PERSON: 12                # repeats escalate; one sighting doesn't
       MULTIPLE_PEOPLE: 12
-      AT_NIGHT_PERSON: 12
       GATE_OPEN: 8
-      VEHICLE_ARRIVING: 6
-      VEHICLE_LEAVING: 4
       DELIVERY: 5
       MAIL_TRUCK: 2
+      KNOWN_VEHICLE: 0          # your own vehicles -- known entity, never scores
 
 # --- Example: an inside-the-garage camera --------------------------------
 garage-cam:
   prompt: >
     This camera is inside a garage. The overhead garage door should normally be
-    closed. A silver sedan and a red pickup truck are usually parked inside. The
-    overhead door slides up to open and down to close.
+    closed. The household cars are usually parked inside. The overhead door
+    slides up to open and down to close.
+
+    PRIORITY RULE, read before choosing: the door is visible in every frame, so
+    door state is the fallback, not the answer. If a person is in the garage,
+    label PERSON even if the overhead door is also open. Use DOOR_OPEN and
+    CLOSED only when nobody is present.
+
     Choose the single best label:
-    PERSON (a person is inside the garage),
-    DOOR_OPEN (the overhead garage door is open or partly open),
-    GARAGE_OPEN_NIGHT (the overhead door is open or partly open AND it is clearly
-    dark/nighttime outside),
-    VEHICLE_MISSING (the door is closed and neither the sedan nor the truck is
-    present -- an expected vehicle is gone),
-    CLOSED (the overhead door is closed and no one is present),
-    NONE (nothing relevant visible).
-    Then briefly describe what you see.
-  # GARAGE_OPEN_NIGHT is deliberately named to NOT contain "DOOR_OPEN" so it can
-  # be logged without alerting. VEHICLE_MISSING is experimental (counting).
-  alert_on: ["PERSON", "DOOR_OPEN"]
+    PERSON (a person is inside the garage, whatever the door is doing),
+    DOOR_OPEN (nobody is present and the overhead garage door is open or partly
+    open),
+    CLOSED (nobody is present and the overhead door is closed),
+    NONE (nothing relevant visible and the door position cannot be made out).
+
+    Use ONLY the labels listed above. Never invent a new label. Then briefly
+    describe what you see, including whether the door is open or closed.
+  # A "VEHICLE_MISSING" label (door closed + expected car gone) was tried here
+  # and retired: 0 uses in 561 frames, and even working it would be noise -- a
+  # car out during the day is routine, and one still frame cannot tell "stolen"
+  # from "at the store". Counting absent objects is a poor fit for this model.
+  # DOOR_OPEN is deliberately NOT here. A door stays open for hours, so an
+  # alerting state label re-fires every cooldown for as long as the condition
+  # lasts: replayed over 28 days it was 147 of 157 emails from this camera. The
+  # decisive part is subtler -- the cooldown is PER CAMERA, so the state label
+  # holds it open and suppresses the occupancy label underneath. Removing
+  # DOOR_OPEN from alert_on took PERSON alerts from 10 to 20 on the same events.
+  # If a state genuinely matters at night, let the risk score's night multiplier
+  # escalate it rather than making it alert around the clock.
+  alert_on: ["PERSON"]
   notify_cooldown_sec: 1800
   risk:
     multiplier: 1.5             # interior space -- anything odd matters more
     label_weights:
-      VEHICLE_MISSING: 20
       PERSON: 12
-      GARAGE_OPEN_NIGHT: 12     # low base weight; the night multiplier escalates it
       DOOR_OPEN: 6              # mostly household comings and goings
 
 # --- Example: a back patio / sliding-door camera (with a known pet) -------
 # You can give the model a label for a specific known subject (e.g. a pet) and
-# leave it out of alert_on so it's logged but never emails. REX below is a made-
-# up dog -- describe your own pet's size/color so the model can distinguish it
-# from a stray ANIMAL.
+# leave it out of alert_on so it's logged but never emails. REX below is a
+# made-up dog -- describe your own pet's size and color so the model can try to
+# distinguish it from a stray ANIMAL. Expect that to be imperfect: on real data
+# the same "small light-brown terrier by the door" got the pet label 4 times and
+# ANIMAL 3 times. That split is survivable ONLY because the pet label is the
+# quiet one -- a mix-up costs a spurious email, never a missed intruder. Put the
+# known-entity label in alert_on and you invert that trade.
 patio-cam:
   prompt: >
     This camera covers a back patio and a sliding glass door (a house entry
     point) plus part of the back yard.
+
+    PRIORITY RULE, read before choosing: label only what is OUTSIDE. People or
+    pets seen through the glass inside the house are not activity -- that is
+    NONE. If both a person and an animal are outside, label the person.
+
     Choose the single best label:
     PERSON_AT_DOOR (a person on the patio or approaching the sliding door),
-    LOITERING (a person lingering in the yard with no clear purpose),
+    MULTIPLE_PEOPLE (a group of two or more people together outside),
+    LOITERING (a person who is outside but not coming to or going from the door
+    -- standing or wandering in the yard, along the fence or gate, or beside the
+    windows, with no apparent task. Someone working in the yard or using the
+    patio normally is not loitering),
+    LOOKING_IN (a person with their face close to the sliding-door glass or a
+    window, hands cupped against the glass or shielding their eyes to see
+    inside, or standing still at close range facing the camera directly),
     REX (our dog: a large brown dog that lives here -- use this label for that
     specific dog),
-    ANIMAL (any other animal, such as a stray dog, deer, cat, or raccoon),
-    LOOKING_IN (a person peering into the sliding door/window or staring at the camera),
-    MULTIPLE_PEOPLE (a group of two or more people together),
-    AT_NIGHT_PERSON (a person present when it is clearly dark/nighttime),
-    NONE (nothing relevant visible).
-    Then briefly describe what you see.
+    ANIMAL (any other animal, such as a stray dog, deer, cat, or raccoon. If a
+    dog is large and brown, prefer REX),
+    NONE (nothing relevant visible -- including an empty patio, weather, moving
+    shadows or sunlight, and anyone or anything seen inside through the glass).
+
+    Use ONLY the labels listed above. Never invent a new label. Then briefly
+    describe what you see.
   # REX is intentionally omitted from alert_on: logged, never emails.
-  alert_on: ["PERSON_AT_DOOR", "LOITERING", "ANIMAL"]
+  alert_on: ["PERSON_AT_DOOR", "LOITERING", "ANIMAL", "LOOKING_IN"]
   notify_cooldown_sec: 300
   risk:
     multiplier: 1.5             # back of house -- higher-signal than the street side
@@ -203,7 +454,6 @@ patio-cam:
       LOITERING: 25
       PERSON_AT_DOOR: 12        # household traffic; repeats escalate
       MULTIPLE_PEOPLE: 12
-      AT_NIGHT_PERSON: 12
       ANIMAL: 4
       REX: 0                    # the known pet -- never scores
 

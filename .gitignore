@@ -3,14 +3,23 @@
 # your real cameras (names/layout); ship cameras.yaml.example
 # (no trailing comments in this file -- git treats them as part of the pattern)
 cameras.yaml
-# local copy of the live prod config (same sensitivity)
+# local copy of the live prod config, and dated baselines kept for prompt A/B
+# and rollback (same sensitivity). Does not match cameras.yaml.example.
 cameras-prod.yaml
+cameras-*.yaml
 events.db
+# any SQLite file -- throwaway CAM_WATCHER_DB copies, replay scratch databases,
+# and anything pulled off the prod box. They all carry real activity history.
+*.db
+# watchdog notification state (which outage it has already emailed about)
+watchdog_state.json
 events.db-journal
 events.db-wal
 events.db-shm
 *.log
+# the .bat wrappers pin a machine-specific Python path; ship the .example
 cam_watcher.bat
+watchdog.bat
 
 # --- Python ---
 __pycache__/
@@ -46,6 +55,17 @@ docs/
 CLAUDE.md
 TO-DO.md
 *.eml
+# Audits the pushable set for real camera/vehicle/pet/host names. It has to
+# NAME them to forbid them, so committing it would publish the list it guards.
+# Runs locally (plain `pytest`), never in CI. See the file's own docstring.
+tests/test_no_real_names.py
+
+# --- BlueIris alert frames ---
+# Alerts are now kept rather than pruned, so this grows without bound and is
+# full of photographs of the household, neighbours, and passers-by. Keep the
+# folder OUTSIDE the repo (point ALERT_IMAGE_DIR at it); this is the backstop.
+# Directory-level, because the *.jpg rule below would not stop a stray .txt.
+Alerts/
 
 # --- Demo folder ---
 demo/*.eml

@@ -1,0 +1,244 @@
+# War stories
+
+The non-obvious problems that came with wiring an LLM into a Windows NVR — most
+hit in production, one headed off by design. The kind of thing that doesn't show
+up in a unit test, and the reason [`events.db`](README.md#inspecting-the-log)
+logs every frame instead of only the interesting ones.
+
+Each entry ends with the generalized lesson, which is the part that transfers.
+
+---
+
+## `&ALERT_PATH` sometimes arrives as a bare filename
+
+Alerts were logged as "image not found" even though BlueIris clearly passed
+*something*. Depending on BlueIris version and settings, the `&ALERT_PATH` macro
+expands to just a filename with no folder.
+
+Fix: `resolve_image()` tries the path as given, then falls back to
+`ALERT_IMAGE_DIR / filename`.
+
+> **Lesson:** don't trust an upstream integration's string format — degrade
+> gracefully instead of assuming an absolute path.
+
+## Service accounts don't share your login's secret store
+
+*(Headed off by design rather than gotten burned by.)*
+
+The Gmail App Password lives in **Windows Credential Manager, which is per-user
+and DPAPI-encrypted**. BlueIris often runs under a *different* account (e.g.
+`LocalSystem`) than the interactive user who would naturally store the
+credential — so an entry saved under your login is invisible to the service, and
+email fails silently.
+
+`notify.resolve_password()` documents storing the credential under the account
+BlueIris actually runs as (`psexec -s -i` for `LocalSystem`), with a
+`GMAIL_PASSWORD` environment fallback.
+
+> **Lesson:** "works when I run it" and "works as a service" are different
+> questions — decide who owns the credential up front.
+
+## A raw event sum scores frame count, not activity
+
+The first risk-scoring calibration replayed two weeks of real events and
+produced **234 URGENT frames — every one a household burst.** BlueIris
+re-triggers motion every ~30 s during sustained activity, so "sum the recent
+events" made *one garage door standing open* look like twenty distinct signals.
+
+The fix wasn't smaller weights, it was a different shape: **repeat dampening** —
+the newest event of each camera+label counts in full, each older repeat counts
+half again. Same data, re-replayed: **11 URGENT frames**, all genuine
+multi-camera person sequences.
+
+> **Lesson:** when a score misbehaves, ask what it is actually measuring — and
+> replayable logs make the fix a five-minute experiment instead of another two
+> weeks of live tuning.
+
+## In the dark, the vision model guesses the alarming answer
+
+The driveway gate label worked fine by day, then `GATE_OPEN_NIGHT` started
+firing almost every night — 00:03, 01:35, 04:56 — while the gate sat closed.
+
+The tell was in the descriptions: identical generic boilerplate ("The gate is
+open, allowing a vehicle to drive through") with zero scene detail. **Hallucination
+has a texture.** In IR the model can't see the latch, and a VLM never says "I
+can't see" — it picks something, and *something skews dramatic*.
+
+Fix: an explicit uncertainty default, in the camera prompt *and* the system
+prompt — "if you cannot clearly see the condition, choose the normal-state
+label; never pick the alarming option because you cannot see clearly."
+
+> **Lesson:** for any alert label, define what the model should say when the
+> evidence is invisible — otherwise it will invent the interesting case, and it
+> will do it every night at 3 a.m.
+
+## A new label can break the labels beside it, and no rewording fixes it
+
+A front-yard camera kept describing a neighbourhood cat as "a person walking on
+the sidewalk", so `ANIMAL` was added to give the cat somewhere to land.
+
+It took **five prompt versions and five A/B runs**, and every one failed
+differently:
+
+| Version | Failure |
+|---|---|
+| v4 | blind to people on the sidewalk — three verified frames labeled `NONE` |
+| v5 | sidewalk people placed *on the property*, plus three invented labels |
+| v6 | both at once, including four frames labeled `APPROACHING_HOUSE` (alerting) whose own descriptions read "walking on the sidewalk, moving **away** from the house" |
+| v7 | best run of the five, still dropping people to `NONE` |
+
+One frame explained all four — labeled `NONE`, described as *"a person walking a
+dog on a leash. The person is on the sidewalk…"*. `ANIMAL` was defined as an
+animal *"with no person around it"*, and **a dog-walker is a person and an
+animal**, so the two labels competed for the same frame and the model answered
+neither. That yard has dog-walkers constantly. The back-patio camera carries
+`ANIMAL` without trouble, because nobody walks a dog across the patio.
+
+The label was dropped, not reworded. The config ended byte-identical to where it
+started — and production never ran any of the five, because each was measured
+before it shipped.
+
+> **Lesson:** before adding a label, grep the descriptions in `events.db` for the
+> scene it covers. If it co-occurs with a label you already have, you are not
+> adding a category — you are splitting one, and both halves get less reliable.
+
+> **Second lesson, cheaper:** the defect being chased was **cosmetic** — a cat
+> logged under a label that never emails. Decide what a fix is worth before the
+> first rewrite, not after the fifth.
+
+## An invented label is a silent miss
+
+The model occasionally answers with a label its prompt never defined
+(`BIRD_FLYING`, `MOWING_LAWN` in normal operation; one bad prompt revision
+produced three in a single 104-frame run). It matches no `alert_on` entry, so
+the event is logged and dropped — **indistinguishable in the database from a
+frame that correctly didn't alert.** One of those invented labels was
+`PERSON_ON_PROPERTY`: exactly the case that should have emailed.
+
+`labels.py` derives the permitted set from each prompt and tags offenders
+`unknown-label`; `review.py --unknown` audits history for them.
+
+> **Lesson:** when your failure mode and your success mode write the same row,
+> add the column that tells them apart.
+
+## The A/B tool was measuring the sampler, not the prompt
+
+Two candidate prompts for a driveway camera were rejected in one evening, on
+disagreement rates of 32% and 49% against the live config. Then the live config
+was run against *itself* — same frames, same prompt on both sides. **It agreed
+with itself on 75% of them.**
+
+The noise floor was 25%, and neither rejection had measured anything. `Modelfile`
+sets `temperature 0.1`, not 0, so a single classification is a *sample* of what a
+prompt answers, and an A/B that runs each config once is comparing two samples.
+
+What rescued the method was that the noise was not uniform:
+
+| Label family | Unanimous across repeated draws |
+|---|---|
+| gate open/closed | 52% |
+| person / vehicle | **100%** — 90 draws, zero variation |
+
+All of the instability sat in one label. The gate is distant chain-link,
+usually backlit or seen at an angle: a genuinely borderline call, where the model
+was not being unreliable so much as being asked a question the image could not
+answer. Occupancy labels never wavered, so the tool measured *those* perfectly
+well — gate-state disagreements simply were not findings on that camera.
+
+That reframed the fix. The unstable label was not a wording problem to solve, it
+was a question worth deleting. Removing the gate labels took self-consistency
+from **64% to 93%** and — because an always-visible state label had been crowding
+out occupancy — recovered a vehicle label that had never once fired in 51,023
+events.
+
+`ab_prompt.py --repeat N` now draws each config N times per frame, reports
+self-consistency broken down per label, and says outright whether the A-vs-B
+difference clears the floor.
+
+> **Lesson:** any evaluation that samples a stochastic model once per item is
+> measuring the sampler as much as the change. Establish the floor first — and
+> check whether it is *concentrated*, because one label that will not hold still
+> is usually a bad question rather than a bad model.
+
+## The model could judge it but not describe it
+
+A driveway camera's `UNFAMILIAR_VEHICLE` label had never fired — 0 times in
+57,948 events — through six prompt rewrites over three weeks. Every rewrite
+assumed the model was seeing the car and picking the wrong label.
+
+The test that settled it: edit the prompt to claim the household cars are "a red
+sedan and a dark green hatchback", then show it a white pickup. **It still
+answered `KNOWN_VEHICLE`, in 47 of 48 draws.** The colour/body-type comparison
+was not happening at all. In a fifteen-label prompt, identity is one clause
+among many, and `KNOWN_VEHICLE` had quietly become the model's word for "a
+vehicle is present". Deleting the "if you cannot tell, choose `KNOWN_VEHICLE`"
+fallback did not unlock it either — those frames just became `NONE`.
+
+The fix was a second call asking only the identity question. The first version
+asked for **attributes** — "answer with its colour and body type" — and compared
+them to a configured list in Python, on the theory that a string comparison
+cannot decline to run. The comparison ran perfectly and the attributes were
+wrong: the household pickup came back `white suv`, and cropped, `silver sedan`,
+both 4/4 unanimous. Two false alarms on the owner's own truck, stable ones, so
+repeated draws could not rescue them.
+
+Asking for the **verdict** instead — "is this one of OUR two vehicles? OURS or
+NOT-OURS" — scored 6/6, 18/18 draws unanimous, across four vehicles that were
+not the household's and two that were. And its free-text descriptions were still
+wrong in exactly the same ways: it called a grey crossover "Black SUV" while
+correctly answering NOT-OURS.
+
+> **Lesson:** when a model is unreliable at *describing* something, don't
+> conclude it is unreliable at *deciding* about it. Taking the intermediate
+> representation and computing the decision yourself feels more rigorous and was
+> measurably worse — it threw away the judgement and rebuilt it out of the least
+> reliable part of the answer.
+
+> **Second lesson:** the question that finally worked was the one asked alone. A
+> capability can be absent from a fifteen-label prompt and present in a
+> one-question prompt, with the same model and the same image.
+
+## The deploy script broke on its own success check
+
+The first deploy in this project that wasn't a single config file — a new
+module, a modified `cam_watcher.py`, and a config — got a PowerShell script so
+the copy order couldn't take alerting dark. The script copied all three files
+correctly, then **crashed on the step that verifies the result**: its regex for
+the pinned Python path in `cam_watcher.bat` anchored on `^\s*set\s+PYTHON=`, the
+real file wrote it differently, and `$null.Matches.Groups[1]` threw.
+
+Net effect: a changed production system and no verdict. The worst pair to hand
+someone mid-deploy, produced by the very step meant to prevent it.
+
+What worked instead needed nothing parsed. `cam_watcher` imports every module at
+load and only *then* validates its arguments, so running the BlueIris wrapper
+with no arguments exercises the whole import graph under the exact pinned
+interpreter and working directory:
+
+```
+cmd /c cam_watcher.bat     ->  "ERROR - Usage: cam_watcher.py ..."
+```
+
+A usage error is the all-clear. A traceback means roll back.
+
+> **Lesson:** a verification step that can itself fail is worse than none, and
+> strictly worse when it runs after the irreversible part. Wrap it, give it a
+> default, and never let it be the thing that throws.
+
+> **Second lesson:** prefer a check that exercises the real entry point over one
+> that reconstructs how the entry point works. The regex was a model of the
+> `.bat`; running the `.bat` was the `.bat`.
+
+## A hard-coded Python path in the `.bat` silently stopped the alerts
+
+`cam_watcher.bat` pins a full path to `python.exe`, because BlueIris runs under
+a service account where `python` isn't on `PATH`. At one point that path was
+wrong and the wrapper stopped launching the script — and because **BlueIris
+ignores the exit code**, nothing surfaced the failure. The household's alerting
+just quietly went dark until someone noticed. (The exact trigger is lost to
+history — this is a home project, not a postmortem culture.)
+
+That outage is why `watchdog.py` exists.
+
+> **Lesson:** a fire-and-forget integration needs a dead-man's switch — silent
+> success and silent failure look identical from the outside.
