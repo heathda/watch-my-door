@@ -1,0 +1,24 @@
+@echo off
+REM Pipeline self-watchdog. Run this from Task Scheduler, NOT from BlueIris --
+REM it is a sidecar, deliberately outside the alert path.
+REM
+REM Task Scheduler setup (same box as BlueIris):
+REM   Action:    Start a program -> this .bat
+REM   Trigger:   Daily, repeat every 5 minutes, indefinitely
+REM   Settings:  "Run whether user is logged on or not", and run it as the SAME
+REM              account BlueIris uses -- the Gmail App Password lives in that
+REM              account's Credential Manager, and the watchdog needs it to be
+REM              able to email you (see notify.resolve_password).
+REM   Uncheck    "Stop the task if it runs longer than..." is unnecessary; a
+REM              pass is a few seconds. Leave "Do not start a new instance" as
+REM              the concurrency rule.
+REM
+REM Exit code is 1 when any check is failing, 0 when healthy -- Task Scheduler
+REM shows that as the "Last Run Result", so the task history is a free uptime
+REM log even if email is down.
+REM
+REM PYTHON is pinned to a full path for the same reason cam_watcher.bat does it:
+REM a service account may not have python on PATH.
+
+set "PYTHON=C:\Program Files\Python312\python.exe"
+"%PYTHON%" "%~dp0watchdog.py" %*
