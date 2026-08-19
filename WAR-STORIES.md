@@ -198,6 +198,65 @@ correctly answering NOT-OURS.
 > capability can be absent from a fifteen-label prompt and present in a
 > one-question prompt, with the same model and the same image.
 
+## One undersized GPU, three different error messages
+
+Swapping in a newer vision model turned a working pipeline into a two-hour
+outage that changed its error message three times. First `request (4702 tokens)
+exceeds the available context size (4096)`. Raise the context and it became
+`CUDA error: out of memory`. Get past that and it became a wall of
+`120,0xx ms` — the client timeout, to the millisecond.
+
+Three symptoms, one cause, and it was never the model: **the alert frames are
+4 MP**. At ~1,000 vision tokens per megapixel that is ~4,700 tokens per frame,
+which overflows a default context, and the encoder buffer for an image that
+size will not fit beside the weights on an 8 GB card — so two cameras firing
+together OOM, and the queue behind them times out.
+
+Fix: cap the long edge of the image *sent to the model* at 1600 px
+(`MAX_IMAGE_EDGE`). Same frame on disk, same attachment in the email, ~2,400
+tokens instead of ~4,700, and per-call latency went from ~45 s to under 10 s.
+
+> **Lesson:** when the error message keeps changing as you fix things, you are
+> walking down a resource ceiling, not fixing separate bugs. Find the input
+> dimension that scales the cost — here, pixels — before tuning the knobs named
+> in the error.
+
+## A reasoning model answers in a field you are not reading
+
+The candidate model returned HTTP 200, no error, no warning — and an empty
+label on every frame. `"content": ""`, with 595 characters sitting in a
+`"thinking"` field the script never looked at.
+
+`parse_answer("")` returns `("", "")`. An empty label matches no `alert_on`
+entry, so the pipeline logs the frame and emails nobody. It looks exactly like
+a quiet afternoon.
+
+Fix: `classify()` now asks `/api/show` what the model advertises and sends
+`think: false` when `thinking` is in its capabilities — gated on capability
+rather than hardcoded, because the incumbent model has no such field and the
+A/B tool swaps between them mid-run.
+
+> **Lesson:** a model upgrade can be strictly better at the task and still break
+> the contract, because the *response shape* changed rather than the answer. A
+> 200 is not a success — assert on the field you actually parse.
+
+## The 8 GB card had one tenant, and I evicted it
+
+Testing a 23 GB model on the box that runs production meant Ollama unloaded the
+live model to make room, then thrashed. Twenty-five alerts failed during the
+probe. Worse, the wreckage was *convincing*: the reloaded production model came
+back with a smaller context, so real frames started failing — and that looked
+exactly like a latent bug that had been there all along.
+
+It was diagnosed as one, and written up as one, before the timestamps gave it
+away: the failures started in the same minute as the first probe, and the
+hourly error rate before it was 0–2.
+
+> **Lesson:** on a single-GPU box the diagnostic *is* a deployment. Check for
+> live traffic before the first probe, and when you find a "pre-existing" bug
+> during an investigation, correlate its start time against your own first
+> command before believing it.
+
 ## The deploy script broke on its own success check
 
 The first deploy in this project that wasn't a single config file — a new

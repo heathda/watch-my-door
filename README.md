@@ -182,6 +182,16 @@ and what generalizes → **[WAR-STORIES.md](WAR-STORIES.md)**.
   asking it on its own before rewording it a seventh time.
 - A verification step that can itself fail is worse than none — and strictly
   worse when it runs *after* the irreversible part.
+- When the error message keeps changing as you fix things, you are walking down
+  a resource ceiling, not fixing separate bugs. Find the input dimension that
+  scales the cost — here, image pixels — before tuning the knobs it names.
+- A model upgrade can be better at the task and still break the contract,
+  because the *response shape* changed. A reasoning model returned HTTP 200 with
+  an empty `content` and its answer in `thinking`; every label came back blank
+  and nothing alerted.
+- On a single-GPU box the diagnostic *is* a deployment. Correlate a
+  "pre-existing" bug's start time against your own first command before
+  believing it.
 
 ## Files
 
@@ -278,11 +288,21 @@ the script.
   Settings → Folders.
 - `OLLAMA_KEEP_ALIVE` — how long Ollama keeps the model warm in GPU memory after
   an alert (default `30m`).
+- `OLLAMA_NUM_CTX` — context window sent with every request (default `8192`).
+  Ollama's own default is 4096, which is smaller than a single 4 MP alert frame
+  (~4,700 vision tokens) and hard-400s the call. This **overrides** any
+  `PARAMETER num_ctx` baked into the model, so it must be set correctly here.
+- `MAX_IMAGE_EDGE` — longest edge, in pixels, of the image *sent to the model*
+  (default `1600`; `0` disables). Only the copy Ollama sees is resized — the
+  stored frame and the emailed attachment stay full resolution.
 
 **On latency:** run `ollama ps` and confirm `100% GPU`. If it shows CPU offload,
 the model doesn't fit in VRAM and that is where the time goes — free some by
-removing unused models. Fully on GPU, alert-image resolution costs a second or
-two, so don't shrink it. → [DESIGN-NOTES.md](DESIGN-NOTES.md#latency-and-the-keep-alive-knob)
+removing unused models. Weights are only half the budget, though: the vision
+encoder needs room *beside* them for the image, and that scales with pixels. On
+an 8 GB card a 4 MP frame costs ~4,700 tokens, ~45 s a call, and OOMs when two
+cameras trigger at once — `MAX_IMAGE_EDGE=1600` roughly halves both.
+→ [WAR-STORIES.md](WAR-STORIES.md#one-undersized-gpu-three-different-error-messages) → [DESIGN-NOTES.md](DESIGN-NOTES.md#latency-and-the-keep-alive-knob)
 on why `OLLAMA_KEEP_ALIVE` is a knob to try rather than a proven fix.
 
 ### 3. BlueIris configuration

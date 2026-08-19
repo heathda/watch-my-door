@@ -18,6 +18,7 @@ is allowed to crash. Every failure path is logged and we exit cleanly.
 """
 
 import base64
+import io
 import logging
 import os
 import re
@@ -60,6 +61,16 @@ OLLAMA_KEEP_ALIVE = _keep_alive(os.getenv("OLLAMA_KEEP_ALIVE", "30m"))
 # BlueIris's &ALERT_PATH can arrive as a bare filename (no folder). If so, we
 # resolve it against this directory -- BlueIris's alert-image storage folder.
 ALERT_IMAGE_DIR = os.getenv("ALERT_IMAGE_DIR", "")
+
+# 4 MP alert frames cost ~4.7K tokens; Ollama's own default context is 4096,
+# which hard-400s every camera except the 1080p one. Sent per request so it
+# also covers vehicle_id's second call and survives an OLLAMA_MODEL swap.
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+# Downscale the frame before the model sees it. A 4 MP frame costs ~45s a call
+# on the 8 GB card and OOMs when two cameras trigger at once; 1600 roughly
+# halves both. 0 disables. Only the copy sent to Ollama is resized -- the file
+# on disk, the archive, and the emailed attachment stay full resolution.
+MAX_IMAGE_EDGE = int(os.getenv("MAX_IMAGE_EDGE", "1600"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,25 +126,80 @@ def _note(base: str | None, unknown: bool, extra: str | None = None) -> str | No
     return "; ".join(parts) or None
 
 
+_MODEL_CAPS: set[str] | None = None
+
+
+def model_capabilities() -> set[str]:
+    """What the configured model advertises, per /api/show. Never raises.
+
+    Used to decide whether to send `think`. qwen2.5vl has no `thinking`
+    capability and may reject the field; every qwen3.5 has it and returns an
+    EMPTY content block unless thinking is explicitly disabled -- which would
+    yield an empty label that can never match `alert_on`. Fails open (empty
+    set), because a missing probe must not stop a classification.
+    """
+    global _MODEL_CAPS
+    if _MODEL_CAPS is None:
+        _MODEL_CAPS = set()
+        try:
+            resp = requests.post(
+                OLLAMA_URL.replace("/api/chat", "/api/show"),
+                json={"model": OLLAMA_MODEL},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            _MODEL_CAPS = set(resp.json().get("capabilities") or [])
+        except Exception as e:  # noqa: BLE001 - never break the alert path
+            logger.warning(f"Could not read model capabilities: {e}")
+    return _MODEL_CAPS
+
+
+def encode_image(path: Path) -> str:
+    """Base64 the frame, downscaled so a 4 MP alert can't OOM the GPU.
+
+    Falls back to the raw bytes on any failure -- an oversized image the model
+    might still handle beats no classification at all.
+    """
+    if not MAX_IMAGE_EDGE:
+        return base64.b64encode(path.read_bytes()).decode()
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if max(w, h) > MAX_IMAGE_EDGE:
+                scale = MAX_IMAGE_EDGE / max(w, h)
+                im = im.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=88)
+            return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:  # noqa: BLE001 - never break the alert path
+        logger.warning(f"[downscale] falling back to original image: {e}")
+        return base64.b64encode(path.read_bytes()).decode()
+
+
 def classify(prompt: str, img_b64: str) -> tuple[str | None, int]:
     """
     Ask Ollama about the image. Returns (raw_answer, latency_ms).
     raw_answer is None on any error (already logged).
     """
     start = time.monotonic()
+    body = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt, "images": [img_b64]}
+        ],
+        "stream": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {"num_ctx": OLLAMA_NUM_CTX},
+    }
+    # Reasoning models put their answer in `thinking` and leave `content` empty,
+    # which parses to an empty label that can never alert. Turn it off.
+    if "thinking" in model_capabilities():
+        body["think"] = False
     try:
-        resp = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [
-                    {"role": "user", "content": prompt, "images": [img_b64]}
-                ],
-                "stream": False,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-            },
-            timeout=OLLAMA_TIMEOUT,
-        )
+        resp = requests.post(OLLAMA_URL, json=body, timeout=OLLAMA_TIMEOUT)
         resp.raise_for_status()
         latency_ms = int((time.monotonic() - start) * 1000)
         answer = resp.json()["message"]["content"].strip()
@@ -186,7 +252,7 @@ def main() -> None:
     image_path = str(image_file)  # use the resolved absolute path downstream
 
     try:
-        img_b64 = base64.b64encode(image_file.read_bytes()).decode()
+        img_b64 = encode_image(image_file)
     except OSError as e:
         logger.error(f"[{cam}] could not read image {image_path}: {e}")
         return
