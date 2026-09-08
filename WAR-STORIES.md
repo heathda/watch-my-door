@@ -198,6 +198,65 @@ correctly answering NOT-OURS.
 > capability can be absent from a fifteen-label prompt and present in a
 > one-question prompt, with the same model and the same image.
 
+## One undersized GPU, three different error messages
+
+Swapping in a newer vision model turned a working pipeline into a two-hour
+outage that changed its error message three times. First `request (4702 tokens)
+exceeds the available context size (4096)`. Raise the context and it became
+`CUDA error: out of memory`. Get past that and it became a wall of
+`120,0xx ms` — the client timeout, to the millisecond.
+
+Three symptoms, one cause, and it was never the model: **the alert frames are
+4 MP**. At ~1,000 vision tokens per megapixel that is ~4,700 tokens per frame,
+which overflows a default context, and the encoder buffer for an image that
+size will not fit beside the weights on an 8 GB card — so two cameras firing
+together OOM, and the queue behind them times out.
+
+Fix: cap the long edge of the image *sent to the model* at 1600 px
+(`MAX_IMAGE_EDGE`). Same frame on disk, same attachment in the email, ~2,400
+tokens instead of ~4,700, and per-call latency went from ~45 s to under 10 s.
+
+> **Lesson:** when the error message keeps changing as you fix things, you are
+> walking down a resource ceiling, not fixing separate bugs. Find the input
+> dimension that scales the cost — here, pixels — before tuning the knobs named
+> in the error.
+
+## A reasoning model answers in a field you are not reading
+
+The candidate model returned HTTP 200, no error, no warning — and an empty
+label on every frame. `"content": ""`, with 595 characters sitting in a
+`"thinking"` field the script never looked at.
+
+`parse_answer("")` returns `("", "")`. An empty label matches no `alert_on`
+entry, so the pipeline logs the frame and emails nobody. It looks exactly like
+a quiet afternoon.
+
+Fix: `classify()` now asks `/api/show` what the model advertises and sends
+`think: false` when `thinking` is in its capabilities — gated on capability
+rather than hardcoded, because the incumbent model has no such field and the
+A/B tool swaps between them mid-run.
+
+> **Lesson:** a model upgrade can be strictly better at the task and still break
+> the contract, because the *response shape* changed rather than the answer. A
+> 200 is not a success — assert on the field you actually parse.
+
+## The 8 GB card had one tenant, and I evicted it
+
+Testing a 23 GB model on the box that runs production meant Ollama unloaded the
+live model to make room, then thrashed. Twenty-five alerts failed during the
+probe. Worse, the wreckage was *convincing*: the reloaded production model came
+back with a smaller context, so real frames started failing — and that looked
+exactly like a latent bug that had been there all along.
+
+It was diagnosed as one, and written up as one, before the timestamps gave it
+away: the failures started in the same minute as the first probe, and the
+hourly error rate before it was 0–2.
+
+> **Lesson:** on a single-GPU box the diagnostic *is* a deployment. Check for
+> live traffic before the first probe, and when you find a "pre-existing" bug
+> during an investigation, correlate its start time against your own first
+> command before believing it.
+
 ## The deploy script broke on its own success check
 
 The first deploy in this project that wasn't a single config file — a new
@@ -242,3 +301,140 @@ That outage is why `watchdog.py` exists.
 
 > **Lesson:** a fire-and-forget integration needs a dead-man's switch — silent
 > success and silent failure look identical from the outside.
+
+## The fix that silenced the alarm it was fixing
+
+The driveway camera was emailing about cars parked on the public street. Not a
+perception failure — the model *said so itself* in the same sentence it raised
+the alarm: "a silver SUV is parked in the driveway beyond the gate, which is not
+our property." Seventeen vehicle events in three days, five of them emails, and
+twelve more filed under `UNKNOWN_VEHICLE` — a label no prompt defines, which the
+model had invented for itself.
+
+That last detail is the diagnosis. The prompt offered no way to say "there is a
+car, and it is not on our property". The only non-alerting answer was `NONE`,
+and the model will not say *nothing* while a car is plainly in the frame — so it
+scattered those frames across whatever labels were available, including the one
+that wakes you up. A missing contrast label, exactly as an earlier entry here
+describes.
+
+So: add `STREET_VEHICLE`. Defined in the prompt, weight 0, deliberately **not**
+in `alert_on`. Against a corpus of eighteen adjudicated frames it was a clean
+sweep — all four emailing false alarms became `STREET_VEHICLE`, unanimous across
+five draws, with the on-driveway vehicles and the `PERSON` frames untouched. By
+every measurement aimed at the problem, it worked on the first attempt.
+
+Then it was scored against a corpus built weeks earlier for a different
+question: the same frames, but with the config lying about which cars belong to
+the household, so that every household vehicle on the driveway is a stranger and
+the alerting label *must* fire.
+
+```
+                        baseline config      with STREET_VEHICLE
+UNFAMILIAR_VEHICLE         7/8 (88%)              0/8 (0%)
+```
+
+Zero. A stranger parked on the driveway came back `KNOWN_VEHICLE` — *ours* — in
+four draws out of five. The new label had widened the space of comfortable
+non-alarming answers, and the model slid into it and stopped raising alarms at
+all. The camera would have gone quiet about the single event it exists for,
+while every dashboard and count aimed at the reported bug looked excellent.
+
+> **Lesson:** a change that fixes false alarms must be measured against a test
+> that can only pass if real alarms still fire — and that test has to lie to the
+> model, because the real event may never have happened on camera. The corpus
+> that caught this took an evening to build and had already been "used up" on a
+> different question months before.
+
+## The camera could not see the thing the label was named for
+
+`APPROACHING_HOUSE` on the front camera had fired 25 times and emailed 19. On
+inspection, 15 of those were people on the **public sidewalk**, two were on the
+property, and the rest were ambiguous. Six prompt revisions went into teaching
+the model the boundary between a pavement and a garden path. Each one fixed one
+label and broke another: the sidewalk cases, then the empty frames, then the
+delivery courier, then the sidewalk cases again.
+
+The seventh attempt was to ask the owner a question I should have asked first:
+where is the camera pointed? It is mounted beside the front door, looking down
+the side of the house. **The door and porch are not in frame.** In 67,000
+events, the camera had never once produced a picture of a person at the door —
+and a deliberate walk-to-the-door test produced five frames, every one of them
+on the sidewalk, with a 41-second gap where the walkway walk should have been.
+
+The label was named for an event this camera physically cannot observe. Its
+"true positive" rate was not low, it was structurally zero, and every alert it
+had ever sent was a false one. Meanwhile the approach path — the driveway — is
+covered by a different camera whose `PERSON` label already includes it.
+
+The fix was one line of config: remove the label from `alert_on`. It stays in
+the prompt, so it is still produced and logged; it just no longer emails. Two
+labels removed that way accounted for **83 of the camera's 201 lifetime emails**.
+
+> **Lesson:** before tuning what a model says about a scene, establish what the
+> camera can see. And when a label fires almost exclusively on the wrong thing,
+> the lever is the alerting config — deterministic, immediate, and immune to the
+> next model upgrade — not a seventh rewording.
+
+## Two probes, opposite answers, no capability
+
+An earlier entry here records the win from taking one question out of a crowded
+fifteen-label prompt and asking it alone. That pattern was the obvious candidate
+for the driveway region problem too, so before building any of the plumbing I
+probed the isolated question over eleven adjudicated frames, five draws each.
+
+Version one described the boundary as a gate. It answered "past the gate" for
+everything near it — including vehicles parked at the far end of our own drive.
+Version two described the driveway as one continuous strip, with the far end
+explicitly ours. It then answered "on our drive" for **everything**, unanimously,
+including a car on the road and a van in a neighbour's driveway.
+
+Both scored 73%. Neither was measuring the vehicle's position; each was echoing
+whichever side of the boundary the prompt had leaned on hardest.
+
+Compare the probe from the time the pattern *did* work: 6 frames, 6 correct,
+18 draws out of 18 unanimous. That is what a real capability looks like when you
+isolate it. Two runs that fail in opposite directions are not a wording problem
+to iterate on.
+
+> **Lesson:** probe an isolated question at least twice, worded to lean opposite
+> ways. If the answer follows your emphasis rather than the image, the model
+> cannot do the task and no second call will rescue it — cost of finding out,
+> twelve minutes; cost of not finding out, a module, a config schema and a test
+> suite built on sand.
+
+## The broken camera that looked like a broken prompt
+
+For weeks the driveway camera had been producing occasional frames with the
+bottom of the image replaced by flat green. It was logged as a cosmetic
+annoyance on a wireless camera and left in the backlog.
+
+It was not cosmetic. The missing region was the driveway itself — and shown a
+frame whose lower two-thirds is a green rectangle, the model does not say it
+cannot see. It describes a vehicle *"parked near the garage"*, precisely where
+the picture ends, and the pipeline emails it.
+
+```
+frames 08-10 .. 08-19            truncation rate by day
+UNFAMILIAR_VEHICLE   20 frames    08-10   6.0%     08-18  13.6%
+  10 truncated (50%)              08-15  19.7%     08-19  24.3%
+  17 emails, 8 from truncated
+overall  1401 frames, 11.9%       after the fix:   0 / 988
+```
+
+Half the vehicle alerts in that window came from frames that did not contain the
+driveway. Worse, it had been quietly poisoning the diagnosis of an unrelated
+bug: of eighteen frames where a second-call identity check had overridden the
+first answer, nine were truncated — so on half of them, the "wrong" decision was
+being made about a vehicle that was never there.
+
+The camera fault and the prompt fault produced the same symptom, in the same
+label, in the same week. Fixing the wireless link removed as much of the noise
+as the code change did, and the code change got all the credit until the frames
+were measured.
+
+> **Lesson:** when a model reports something impossible, check the input before
+> debugging the reasoning. And an input-integrity check is worth building even
+> for a fault you have already fixed — nothing in the pipeline could tell a
+> corrupt frame from an empty driveway, so both wrote the same row and neither
+> raised a flag.

@@ -61,7 +61,6 @@ email. Safe to run against the live database while BlueIris keeps firing.
 """
 
 import argparse
-import base64
 import sqlite3
 import statistics
 import sys
@@ -276,7 +275,10 @@ def compare(rows, cfg_a, cfg_b, stored_as_a=False, repeat=1, echo=print):
     total, t0 = len(rows), time.monotonic()
     for i, (ts_iso, camera, stored, image_file) in enumerate(rows, 1):
         try:
-            img_b64 = base64.b64encode(image_file.read_bytes()).decode()
+            # encode_image(), not raw bytes: prod downscales to MAX_IMAGE_EDGE
+            # before the model sees anything, and an A/B run at full resolution
+            # would score a frame production never sends.
+            img_b64 = cam_watcher.encode_image(image_file)
         except OSError as e:
             echo(f"  [{i}/{total}] {ts_iso} unreadable: {e}")
             continue

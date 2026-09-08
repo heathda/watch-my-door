@@ -2,3 +2,4 @@ requests
 PyYAML
 python-dotenv
 keyring
+Pillow
