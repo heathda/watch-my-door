@@ -192,6 +192,21 @@ and what generalizes → **[WAR-STORIES.md](WAR-STORIES.md)**.
 - On a single-GPU box the diagnostic *is* a deployment. Correlate a
   "pre-existing" bug's start time against your own first command before
   believing it.
+- A change that removes false alarms must be scored against a test that can only
+  pass if the real alarm still fires. One that fixed every false alarm on the
+  driveway camera drove genuine-stranger detection to **0/8** — caught only by a
+  corpus that lies to the model about which cars are the household's.
+- Before tuning what the model says about a scene, establish what the camera can
+  see. A label that had emailed 19 times was named for an event that camera
+  physically cannot observe; the fix was one line of alerting config, not a
+  seventh prompt rewrite.
+- Probe an isolated question twice, worded to lean opposite ways. If the answer
+  follows your emphasis rather than the image, the capability isn't there and no
+  second call will rescue it.
+- When a model reports something impossible, check the input before debugging the
+  reasoning. Half of one camera's vehicle alerts came from frames whose lower
+  two-thirds had been replaced by flat green — and the model described a vehicle
+  parked exactly where the picture ended.
 
 ## Files
 

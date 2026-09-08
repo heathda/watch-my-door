@@ -301,3 +301,140 @@ That outage is why `watchdog.py` exists.
 
 > **Lesson:** a fire-and-forget integration needs a dead-man's switch — silent
 > success and silent failure look identical from the outside.
+
+## The fix that silenced the alarm it was fixing
+
+The driveway camera was emailing about cars parked on the public street. Not a
+perception failure — the model *said so itself* in the same sentence it raised
+the alarm: "a silver SUV is parked in the driveway beyond the gate, which is not
+our property." Seventeen vehicle events in three days, five of them emails, and
+twelve more filed under `UNKNOWN_VEHICLE` — a label no prompt defines, which the
+model had invented for itself.
+
+That last detail is the diagnosis. The prompt offered no way to say "there is a
+car, and it is not on our property". The only non-alerting answer was `NONE`,
+and the model will not say *nothing* while a car is plainly in the frame — so it
+scattered those frames across whatever labels were available, including the one
+that wakes you up. A missing contrast label, exactly as an earlier entry here
+describes.
+
+So: add `STREET_VEHICLE`. Defined in the prompt, weight 0, deliberately **not**
+in `alert_on`. Against a corpus of eighteen adjudicated frames it was a clean
+sweep — all four emailing false alarms became `STREET_VEHICLE`, unanimous across
+five draws, with the on-driveway vehicles and the `PERSON` frames untouched. By
+every measurement aimed at the problem, it worked on the first attempt.
+
+Then it was scored against a corpus built weeks earlier for a different
+question: the same frames, but with the config lying about which cars belong to
+the household, so that every household vehicle on the driveway is a stranger and
+the alerting label *must* fire.
+
+```
+                        baseline config      with STREET_VEHICLE
+UNFAMILIAR_VEHICLE         7/8 (88%)              0/8 (0%)
+```
+
+Zero. A stranger parked on the driveway came back `KNOWN_VEHICLE` — *ours* — in
+four draws out of five. The new label had widened the space of comfortable
+non-alarming answers, and the model slid into it and stopped raising alarms at
+all. The camera would have gone quiet about the single event it exists for,
+while every dashboard and count aimed at the reported bug looked excellent.
+
+> **Lesson:** a change that fixes false alarms must be measured against a test
+> that can only pass if real alarms still fire — and that test has to lie to the
+> model, because the real event may never have happened on camera. The corpus
+> that caught this took an evening to build and had already been "used up" on a
+> different question months before.
+
+## The camera could not see the thing the label was named for
+
+`APPROACHING_HOUSE` on the front camera had fired 25 times and emailed 19. On
+inspection, 15 of those were people on the **public sidewalk**, two were on the
+property, and the rest were ambiguous. Six prompt revisions went into teaching
+the model the boundary between a pavement and a garden path. Each one fixed one
+label and broke another: the sidewalk cases, then the empty frames, then the
+delivery courier, then the sidewalk cases again.
+
+The seventh attempt was to ask the owner a question I should have asked first:
+where is the camera pointed? It is mounted beside the front door, looking down
+the side of the house. **The door and porch are not in frame.** In 67,000
+events, the camera had never once produced a picture of a person at the door —
+and a deliberate walk-to-the-door test produced five frames, every one of them
+on the sidewalk, with a 41-second gap where the walkway walk should have been.
+
+The label was named for an event this camera physically cannot observe. Its
+"true positive" rate was not low, it was structurally zero, and every alert it
+had ever sent was a false one. Meanwhile the approach path — the driveway — is
+covered by a different camera whose `PERSON` label already includes it.
+
+The fix was one line of config: remove the label from `alert_on`. It stays in
+the prompt, so it is still produced and logged; it just no longer emails. Two
+labels removed that way accounted for **83 of the camera's 201 lifetime emails**.
+
+> **Lesson:** before tuning what a model says about a scene, establish what the
+> camera can see. And when a label fires almost exclusively on the wrong thing,
+> the lever is the alerting config — deterministic, immediate, and immune to the
+> next model upgrade — not a seventh rewording.
+
+## Two probes, opposite answers, no capability
+
+An earlier entry here records the win from taking one question out of a crowded
+fifteen-label prompt and asking it alone. That pattern was the obvious candidate
+for the driveway region problem too, so before building any of the plumbing I
+probed the isolated question over eleven adjudicated frames, five draws each.
+
+Version one described the boundary as a gate. It answered "past the gate" for
+everything near it — including vehicles parked at the far end of our own drive.
+Version two described the driveway as one continuous strip, with the far end
+explicitly ours. It then answered "on our drive" for **everything**, unanimously,
+including a car on the road and a van in a neighbour's driveway.
+
+Both scored 73%. Neither was measuring the vehicle's position; each was echoing
+whichever side of the boundary the prompt had leaned on hardest.
+
+Compare the probe from the time the pattern *did* work: 6 frames, 6 correct,
+18 draws out of 18 unanimous. That is what a real capability looks like when you
+isolate it. Two runs that fail in opposite directions are not a wording problem
+to iterate on.
+
+> **Lesson:** probe an isolated question at least twice, worded to lean opposite
+> ways. If the answer follows your emphasis rather than the image, the model
+> cannot do the task and no second call will rescue it — cost of finding out,
+> twelve minutes; cost of not finding out, a module, a config schema and a test
+> suite built on sand.
+
+## The broken camera that looked like a broken prompt
+
+For weeks the driveway camera had been producing occasional frames with the
+bottom of the image replaced by flat green. It was logged as a cosmetic
+annoyance on a wireless camera and left in the backlog.
+
+It was not cosmetic. The missing region was the driveway itself — and shown a
+frame whose lower two-thirds is a green rectangle, the model does not say it
+cannot see. It describes a vehicle *"parked near the garage"*, precisely where
+the picture ends, and the pipeline emails it.
+
+```
+frames 08-10 .. 08-19            truncation rate by day
+UNFAMILIAR_VEHICLE   20 frames    08-10   6.0%     08-18  13.6%
+  10 truncated (50%)              08-15  19.7%     08-19  24.3%
+  17 emails, 8 from truncated
+overall  1401 frames, 11.9%       after the fix:   0 / 988
+```
+
+Half the vehicle alerts in that window came from frames that did not contain the
+driveway. Worse, it had been quietly poisoning the diagnosis of an unrelated
+bug: of eighteen frames where a second-call identity check had overridden the
+first answer, nine were truncated — so on half of them, the "wrong" decision was
+being made about a vehicle that was never there.
+
+The camera fault and the prompt fault produced the same symptom, in the same
+label, in the same week. Fixing the wireless link removed as much of the noise
+as the code change did, and the code change got all the credit until the frames
+were measured.
+
+> **Lesson:** when a model reports something impossible, check the input before
+> debugging the reasoning. And an input-integrity check is worth building even
+> for a fault you have already fixed — nothing in the pipeline could tell a
+> corrupt frame from an empty driveway, so both wrote the same row and neither
+> raised a flag.
