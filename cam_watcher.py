@@ -20,6 +20,7 @@ is allowed to crash. Every failure path is logged and we exit cleanly.
 import base64
 import io
 import logging
+import ntpath
 import os
 import re
 import sys
@@ -220,12 +221,18 @@ def resolve_image(image_path: str) -> Path | None:
     depending on version/settings, just a bare filename. Try it as given first,
     then fall back to ALERT_IMAGE_DIR / filename. Returns the resolved Path, or
     None if the file can't be found.
+
+    The basename is taken with ntpath, not Path.name, because the tuning tools
+    replay paths stored by the WINDOWS box (C:\\BlueIris\\Alerts\\x.jpg) on the
+    Linux dev box, where Path() does not treat a backslash as a separator and
+    .name returns the whole string -- so the ALERT_IMAGE_DIR fallback never
+    matches. ntpath.basename splits on both separators; prod is unchanged.
     """
     p = Path(image_path)
     if p.is_file():
         return p
     if ALERT_IMAGE_DIR:
-        candidate = Path(ALERT_IMAGE_DIR) / p.name
+        candidate = Path(ALERT_IMAGE_DIR) / ntpath.basename(image_path)
         if candidate.is_file():
             return candidate
     return None
