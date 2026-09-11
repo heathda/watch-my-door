@@ -38,6 +38,7 @@ venv/
 *.jpeg
 *.png
 *.bmp
+camconfig/
 
 # --- OS cruft ---
 Thumbs.db
@@ -72,3 +73,6 @@ demo/*.eml
 # Images are ignored globally above; allow ONE curated, censored demo screenshot.
 # Name your redacted email screenshot exactly this to commit it:
 !demo/example-alert.png
+
+# Per-machine Claude Code settings: holds real camera names and local paths.
+.claude/settings.local.json

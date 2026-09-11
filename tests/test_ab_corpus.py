@@ -16,8 +16,10 @@ CORPORA = sorted((Path(__file__).resolve().parent.parent / "docs" / "corpus").gl
 
 
 @pytest.fixture()
-def conn(tmp_path, monkeypatch):
-    monkeypatch.setenv("CAM_WATCHER_DB", str(tmp_path / "events.db"))
+def conn(temp_db):
+    # temp_db patches db.DB_FILE. Setting CAM_WATCHER_DB here would do nothing:
+    # db reads it once at import, so this fixture used to write into the REAL
+    # events.db -- one junk row per test, every run.
     con = db.connect()
     db.log_event(con, camera="driveway-cam", classification="NONE", description="",
                  raw_response="NONE", latency_ms=1,
